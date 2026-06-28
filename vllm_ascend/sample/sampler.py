@@ -130,6 +130,14 @@ class AscendTopKTopPSampler(TopKTopPSampler):
 
     def forward_native(self, logits, generators, k, p):
         """Override pytorch native implementation to torch_npu"""
+        # DKV(drkernel-npu): force the vLLM reference sampler — bypass the ascend custom
+        # TP-sample path (the reduce_sample / TP all-gather / -inf-scatter reconstructed
+        # in #9946 @367b8e62) that corrupts some tokens' logprobs (271/'\n\n' and OOV
+        # 151669) under TP>1 -> MRS over-rejection / -inf -> stalled RL training. This
+        # yields the sampler's batch-invariant CORRECTNESS WITHOUT the global
+        # VLLM_BATCH_INVARIANT slowdown (which also de-opts attention/matmul ~90min/step).
+        # Delete the next line to restore the custom path.
+        return super().forward_native(logits, generators, k, p)
         # when batch_invariant mode is enabled, we should use vllm's implementation.
         # or it will make batch_invariant mode not working.
         if envs.VLLM_BATCH_INVARIANT:
