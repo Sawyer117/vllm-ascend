@@ -1148,6 +1148,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 num_blk = logits.shape[0]
                 draft_token_ids = torch.empty(num_blk, blk, dtype=torch.int64, device=last_hidden_states.device)
                 nt = getattr(self, "_next_token_ids", None)
+                if nt is not None and __import__("os").environ.get("DSPARK_DEBUG"):
+                    print(f"[DSPARK] rows={last_hidden_states.shape[0]} batch_size={batch_size} "
+                          f"num_blk={num_blk} nt_len={nt.shape[0]}", flush=True)
                 if nt is not None:
                     n = min(nt.shape[0], num_blk)
                     draft_token_ids[:n, 0] = nt[:n]
