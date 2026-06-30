@@ -1146,16 +1146,14 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 raw_logits = self.model.compute_logits(last_hidden_states)
                 logits = raw_logits.view(-1, blk, raw_logits.shape[-1])
                 num_blk = logits.shape[0]
-                draft_token_ids = torch.empty(num_blk, blk, dtype=torch.int64, device=last_hidden_states.device)
-                nt = getattr(self, "_next_token_ids", None)
-                if nt is not None:
-                    n = min(nt.shape[0], num_blk)
-                    draft_token_ids[:n, 0] = nt[:n]
-                    if n < num_blk:
-                        draft_token_ids[n:, 0] = 0
-                else:
-                    # dummy_run / cudagraph capture: real next token not set yet
-                    draft_token_ids[:, 0] = 0
+                # Cudagraph-safe drafting: both the rolling draft buffer and the Markov seed
+                # (position 0) live at FIXED addresses so graph replay reads fresh data. The
+                # original PR used a per-call torch.empty and seeded from self._next_token_ids,
+                # which is reassigned to a new tensor every decode step — the captured graph kept
+                # copying the stale capture-time seed and the Markov chain (accept length)
+                # collapsed. set_inputs_first_pass now copy_()s the seed into _dspark_seed_buffer.
+                draft_token_ids = self._dspark_draft_buffer[:num_blk]
+                draft_token_ids[:, 0] = self._dspark_seed_buffer[:num_blk]
                 for idx in range(self.num_speculative_tokens):
                     logits_bias, _ = self.model.model.markov_head(draft_token_ids[:, idx])
                     logits[:, idx] += logits_bias
