@@ -1137,13 +1137,25 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         else:
             if hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type"):
                 # [batch_size, self.num_speculative_tokens + 1]
-                draft_token_ids = torch.empty(batch_size, self.num_speculative_tokens + 1, dtype=torch.int64, device=last_hidden_states.device)
-                if getattr(self, "_next_token_ids", None) is not None:
-                    draft_token_ids[:, 0] = self._next_token_ids
+                # last_hidden_states is the draft block output (batch*(num_spec+1) rows in real
+                # decode). Derive the block count from the tensor itself so cudagraph capture —
+                # which feeds a different dummy batch than batch_size — stays consistent. Keep the
+                # vocab dim explicit so view() only infers the batch dim (the original used
+                # batch_size + view(-1), which mis-inferred the vocab dim during capture).
+                blk = self.num_speculative_tokens + 1
+                raw_logits = self.model.compute_logits(last_hidden_states)
+                logits = raw_logits.view(-1, blk, raw_logits.shape[-1])
+                num_blk = logits.shape[0]
+                draft_token_ids = torch.empty(num_blk, blk, dtype=torch.int64, device=last_hidden_states.device)
+                nt = getattr(self, "_next_token_ids", None)
+                if nt is not None:
+                    n = min(nt.shape[0], num_blk)
+                    draft_token_ids[:n, 0] = nt[:n]
+                    if n < num_blk:
+                        draft_token_ids[n:, 0] = 0
                 else:
                     # dummy_run / cudagraph capture: real next token not set yet
                     draft_token_ids[:, 0] = 0
-                logits = self.model.compute_logits(sample_hidden_states).view(batch_size, self.num_speculative_tokens, -1)
                 for idx in range(self.num_speculative_tokens):
                     logits_bias, _ = self.model.model.markov_head(draft_token_ids[:, idx])
                     logits[:, idx] += logits_bias
