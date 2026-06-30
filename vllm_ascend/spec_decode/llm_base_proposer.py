@@ -1138,7 +1138,11 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             if hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type"):
                 # [batch_size, self.num_speculative_tokens + 1]
                 draft_token_ids = torch.empty(batch_size, self.num_speculative_tokens + 1, dtype=torch.int64, device=last_hidden_states.device)
-                draft_token_ids[:, 0] = self._next_token_ids
+                if getattr(self, "_next_token_ids", None) is not None:
+                    draft_token_ids[:, 0] = self._next_token_ids
+                else:
+                    # dummy_run / cudagraph capture: real next token not set yet
+                    draft_token_ids[:, 0] = 0
                 logits = self.model.compute_logits(last_hidden_states).view(batch_size, self.num_speculative_tokens + 1, -1)
                 for idx in range(self.num_speculative_tokens):
                     logits_bias, _ = self.model.model.markov_head(draft_token_ids[:, idx])
