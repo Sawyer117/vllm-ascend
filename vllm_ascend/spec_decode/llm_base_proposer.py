@@ -1143,7 +1143,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 else:
                     # dummy_run / cudagraph capture: real next token not set yet
                     draft_token_ids[:, 0] = 0
-                logits = self.model.compute_logits(last_hidden_states).view(batch_size, self.num_speculative_tokens + 1, -1)
+                logits = self.model.compute_logits(sample_hidden_states).view(batch_size, self.num_speculative_tokens, -1)
                 for idx in range(self.num_speculative_tokens):
                     logits_bias, _ = self.model.model.markov_head(draft_token_ids[:, idx])
                     logits[:, idx] += logits_bias
