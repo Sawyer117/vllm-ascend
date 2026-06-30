@@ -74,7 +74,7 @@ class DSparkMarkovHead(nn.Module):
         return logits.view(*embeds.shape[:-1], -1), embeds
 
 
-ori_init = DFlashQwen3Model._init
+ori_init = DFlashQwen3Model.__init__
 
 def new_init(
     self,
@@ -98,4 +98,4 @@ def new_init(
         self.markov_head = DSparkMarkovHead(vllm_config, prefix=f"{prefix}.markov_head")
         self.confidence_head = DSparkConfidenceHead(vllm_config, prefix=f"{prefix}.confidence_head")
 
-DFlashQwen3Model._init = new_init
+DFlashQwen3Model.__init__ = new_init
