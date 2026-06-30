@@ -450,7 +450,13 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
                     layer_module.shared_head.head = model.lm_head
 
-        if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
+        # DSpark's draft runs a data-dependent Markov loop (per-step argmax feeds the next step's
+        # embedding gather) that is NOT safe under a FULL aclgraph: the captured draft_token_ids
+        # buffer goes stale on replay, collapsing accept length (~5.7 eager -> ~3.6 graph). Keep
+        # the DSpark draft eager; the target model keeps its own cudagraph so verify stays fast.
+        is_dspark = hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type")
+        if (self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
+                and self.use_cuda_graph and not is_dspark):
             logger.info(
                 "[spec_decode/base] Wrapping draft model with ACLGraphWrapper:"
                 " runtime_mode=FULL, use_eagle=%s, enable_enpu=%s",
