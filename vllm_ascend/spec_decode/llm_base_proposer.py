@@ -2131,6 +2131,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
     # update full-graph params for one spec token
     def _update_full_graph_params(self, forward_context, num_tokens, draft_attn_metadatas=None):
+        # DSpark draft runs eager (not wrapped in a FULL aclgraph) -> no captured graph to update.
+        if getattr(self, "update_stream", None) is None:
+            return
         assert len(self.draft_attn_groups) > 0
         attn_backend = self.draft_attn_groups[0].backend
         update_full_graph_params(
