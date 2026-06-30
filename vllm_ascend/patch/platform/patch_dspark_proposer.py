@@ -30,7 +30,7 @@ class DSparkConfidenceHead(nn.Module):
         self.proj = ReplicatedLinear(
             config.hidden_size + rank,
             1,
-            bias=False,
+            bias=True,  # released dspark_qwen3_*_block7 ckpt has confidence_head.proj.bias
             params_dtype=torch.float32,
             quant_config=None,
             prefix=f"{prefix}.proj",
