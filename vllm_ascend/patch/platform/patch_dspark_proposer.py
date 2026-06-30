@@ -26,7 +26,7 @@ class DSparkConfidenceHead(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
-        rank = int(getattr(config, "dspark_markov_rank", 256))
+        rank = int(getattr(config, "markov_rank", getattr(config, "dspark_markov_rank", 256)))
         self.proj = ReplicatedLinear(
             config.hidden_size + rank,
             1,
@@ -42,7 +42,7 @@ class DSparkConfidenceHead(nn.Module):
         markov_embeds: torch.Tensor,
     ) -> torch.Tensor:
         x = torch.cat([hidden_states, markov_embeds], dim=-1)
-        confidence = _linear_output(self.proj(x.float()))
+        confidence, _ = self.proj(x.float())  # ReplicatedLinear returns (output, bias)
         return confidence.squeeze(-1)
 
 
@@ -50,7 +50,7 @@ class DSparkMarkovHead(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str) -> None:
         super().__init__()
         config = vllm_config.model_config.hf_config
-        rank = int(getattr(config, "dspark_markov_rank", 256))
+        rank = int(getattr(config, "markov_rank", getattr(config, "dspark_markov_rank", 256)))
         self.markov_w1 = VocabParallelEmbedding(
             config.vocab_size,
             rank,

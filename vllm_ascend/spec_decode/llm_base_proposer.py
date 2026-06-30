@@ -1135,7 +1135,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     )
                 draft_token_ids = logits.argmax(dim=-1)
         else:
-            if hasattr(self.speculative_config.draft_model_config.hf_confif, "markov_head_type"):
+            if hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type"):
                 # [batch_size, self.num_speculative_tokens + 1]
                 draft_token_ids = torch.empty(batch_size, self.num_speculative_tokens + 1, dtype=torch.int64, device=last_hidden_states.device)
                 draft_token_ids[:, 0] = self._next_token_ids
@@ -1158,7 +1158,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         # Early exit if there is only one draft token to be generated.
         if self.num_speculative_tokens == 1 or self.parallel_drafting:
-            if hasattr(self.speculative_config.draft_model_config.hf_confif, "markov_head_type"):
+            if hasattr(self.speculative_config.draft_model_config.hf_config, "markov_head_type"):
                 return draft_token_ids[:, 1:]
             else:
                 # [batch_size, 1]
