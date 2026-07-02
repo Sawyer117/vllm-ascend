@@ -1650,6 +1650,22 @@ class AscendDSAImpl(DSAAttentionImpl):
         elif olora_tp_enable():
             o_proj_input = self.wo_a(o_proj_input)
             output[...] = self.wo_b(o_proj_input)
+        elif self.n_local_groups == 1:
+            # TP collapses o_proj to a single group here, so this is just a plain
+            # [group_hidden_dim -> o_lora_rank] linear. Use a bare matmul to sidestep
+            # npu_transpose_batchmatmul entirely: it (a) rejects the 2D wo_a that some
+            # w8a8 layers load ("Dimension out of range ... got 2") and (b) is
+            # unnecessary for a single group. Handles both the 3D [1, ghd, rank] and
+            # 2D [rank, ghd] wo_a layouts seen on DeepSeek-V4-Flash w8a8.
+            wo_a_w = self.wo_a.weight
+            if wo_a_w.dim() == 3:
+                w2 = wo_a_w.reshape(group_hidden_dim, self.o_lora_rank)
+            else:
+                w2 = wo_a_w.t()
+            o_proj_input = torch.matmul(
+                o_proj_input.reshape(num_tokens, group_hidden_dim), w2
+            )
+            output[...] = self.wo_b(o_proj_input)
         else:
             o_proj_input = torch_npu.npu_transpose_batchmatmul(
                 o_proj_input,
