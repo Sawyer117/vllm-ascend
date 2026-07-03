@@ -83,7 +83,11 @@ from vllm_ascend.utils import (
     extract_dsv4_layer_index,
     get_ascend_device_type,
     get_dsv4_compress_ratio,
+    vllm_version_is,
 )
+
+if not vllm_version_is("0.23.0"):
+    from vllm.model_executor.layers.fused_moe import fused_moe_make_expert_params_mapping
 
 
 def _make_deepseek_v4_expert_params_mapping(
