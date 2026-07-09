@@ -35,6 +35,7 @@ its own disjoint set of requests.
 """
 
 import os
+import re
 
 import torch
 from safetensors.torch import save_file
@@ -179,9 +180,10 @@ class DsparkHSDumper:
     def _stem(req_id) -> str:
         """File stem ``hs_<rollout_row_index>``.
 
-        The extraction client sets the request id to the rollout row index so the
-        trainer (which reads ``hs_{index}.safetensors``) picks files up automatically.
-        If the id already looks like ``hs_...`` use it verbatim; otherwise prefix.
+        The driver tags each request with ``X-Request-Id = hs_<index>``; vLLM wraps it
+        (e.g. ``cmpl-hs_<index>``), so extract the ``hs_<digits>`` token so the trainer
+        (which reads ``hs_{index}.safetensors``) picks files up automatically. Untagged
+        stray traffic falls back to ``hs_<req_id>`` (harmless: the trainer ignores it).
         """
-        s = str(req_id)
-        return s if s.startswith("hs_") else f"hs_{s}"
+        m = re.search(r"hs_\d+", str(req_id))
+        return m.group(0) if m else f"hs_{req_id}"
