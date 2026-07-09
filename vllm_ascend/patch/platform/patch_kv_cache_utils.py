@@ -19,6 +19,21 @@ from vllm.v1.kv_cache_interface import (
 
 _orig_resolve_kv_cache_block_sizes = vllm.v1.core.kv_cache_utils.resolve_kv_cache_block_sizes
 
+try:
+    from vllm.v1.kv_cache_interface import HiddenStateCacheSpec as _HiddenStateCacheSpec
+except ImportError:
+    _HiddenStateCacheSpec = None
+
+
+def _is_passthrough_spec(spec) -> bool:
+    """HiddenStateCacheSpec (added by method=extract_hidden_states) SUBCLASSES
+    MLAAttentionSpec but is NOT an attention KV cache. It must bypass the MLA/SWA
+    compress_ratio grouping + page-size planning and be passed through with its own
+    KV tensor. isinstance(spec, MLAAttentionSpec) is True for it, so key off the type."""
+    if _HiddenStateCacheSpec is not None:
+        return isinstance(spec, _HiddenStateCacheSpec)
+    return type(spec).__name__ == "HiddenStateCacheSpec"
+
 
 def _ascend_resolve_kv_cache_block_sizes(
     kv_cache_config: KVCacheConfig,
@@ -99,6 +114,28 @@ def _get_kv_cache_groups_uniform_groups(
     Generate the KV cache groups from the grouped specs.
     """
     assert len(grouped_specs) > 0 and all(isinstance(spec, UniformTypeKVCacheSpecs) for spec in grouped_specs)
+
+    # Separate passthrough groups (non-MLA/non-SWA, e.g. the HiddenStateCacheSpec
+    # that method=extract_hidden_states adds) from the attention KV caches. The
+    # MLA/SWA page-size unification below applies only to attention layers;
+    # passthrough groups are appended unchanged here and given their own KV
+    # tensors in _get_kv_cache_config_deepseek_v4. Also (re)order so the MLA
+    # groups come first (ratio 4 first) — vLLM core may interleave a passthrough
+    # group between them.
+    def _inner_spec(_g):
+        return next(iter(_g.kv_cache_specs.values()))
+    _swa_specs = [g for g in grouped_specs if isinstance(_inner_spec(g), SlidingWindowMLASpec)]
+    _mla_specs = [g for g in grouped_specs
+                  if isinstance(_inner_spec(g), MLAAttentionSpec) and g not in _swa_specs
+                  and not _is_passthrough_spec(_inner_spec(g))]
+    passthrough_groups = [
+        KVCacheGroupSpec(layer_names=list(g.kv_cache_specs.keys()), kv_cache_spec=g)
+        for g in grouped_specs if g not in _mla_specs and g not in _swa_specs
+    ]
+    _mla_specs = sorted(
+        _mla_specs, key=lambda g: (_inner_spec(g).compress_ratio != 4, _inner_spec(g).compress_ratio))
+    grouped_specs = [*_mla_specs, *_swa_specs]
+
     # For now, we restrict the first grouped_spec to be UniformTypeKVCacheSpecs
     # containing only MLAAttentionSpec.
     full_mla_spec = grouped_specs[0]
@@ -181,7 +218,7 @@ def _get_kv_cache_groups_uniform_groups(
                 )
             )
 
-    return [full_mla_group, full_mla_c128_group, *swa_mla_groups]
+    return [full_mla_group, full_mla_c128_group, *swa_mla_groups, *passthrough_groups]
 
 
 def _get_kv_cache_config_deepseek_v4(
@@ -210,10 +247,18 @@ def _get_kv_cache_config_deepseek_v4(
     # bucket). bucketed[g_idx][page_size] = [layer_name, ...].
     mtp_layer_names = []
     mtp_page_size = 0
+    passthrough_layers: list[tuple[str, int]] = []  # (name, page_size) for non-MLA/SWA (e.g. HiddenStateCacheSpec)
     bucketed: list[dict[int, list[str]]] = []
     for group in kv_cache_groups:
         assert isinstance(group.kv_cache_spec, UniformTypeKVCacheSpecs)
         specs = group.kv_cache_spec.kv_cache_specs
+        if _is_passthrough_spec(next(iter(specs.values()))):
+            # passthrough (e.g. HiddenStateCacheSpec from extract_hidden_states):
+            # its own KV tensor(s), outside the MLA/SWA page-size bucketing.
+            for name in group.layer_names:
+                passthrough_layers.append((name, specs[name].page_size_bytes))
+            bucketed.append({})
+            continue
         b: dict[int, list[str]] = defaultdict(list)
         for name in group.layer_names:
             if "mtp" not in name:
@@ -227,9 +272,16 @@ def _get_kv_cache_config_deepseek_v4(
     # full-MLA group this equals the count of layers in the largest
     # per-page-size bucket (= get_num_layer_tuples()); for SWA sub-groups
     # this equals the sub-group size (each has a single page_size).
-    num_layer_tuples = max(len(layers) for b in bucketed for layers in b.values()) + len(mtp_layer_names)
+    num_layer_tuples = (
+        max(len(layers) for b in bucketed for layers in b.values())
+        + len(mtp_layer_names))
 
-    num_blocks = available_memory // (layer_tuple_page_bytes * num_layer_tuples)
+    # Reserve passthrough caches (e.g. HiddenStateCacheSpec) by their ACTUAL per-block
+    # bytes in the denominator — their page_size can be >> a normal MLA layer-tuple, so
+    # counting them as one layer-tuple slot severely under-reserves and OOMs at alloc.
+    passthrough_page_bytes = sum(ps for _, ps in passthrough_layers)
+    num_blocks = available_memory // (
+        layer_tuple_page_bytes * num_layer_tuples + passthrough_page_bytes)
     num_blocks = may_override_num_blocks(vllm_config, num_blocks)
 
     kv_cache_tensors: list[KVCacheTensor] = []
@@ -243,6 +295,8 @@ def _get_kv_cache_config_deepseek_v4(
             kv_cache_tensors.append(KVCacheTensor(size=ps * num_blocks, shared_by=shared_by))
     for i in range(len(mtp_layer_names)):
         kv_cache_tensors.append(KVCacheTensor(size=mtp_page_size * num_blocks, shared_by=[mtp_layer_names[i]]))
+    for _pt_name, _pt_ps in passthrough_layers:
+        kv_cache_tensors.append(KVCacheTensor(size=_pt_ps * num_blocks, shared_by=[_pt_name]))
 
     return num_blocks, kv_cache_tensors
 
