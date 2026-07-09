@@ -562,6 +562,9 @@ class NPUModelRunner(GPUModelRunner):
             ),
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
         )
+        # Plan B DSpark HS dumper (opt-in DSPARK_HS_DUMP=1); lazily built on first
+        # execute_model so TP rank is known. See vllm_ascend/dspark_hs_dumper.py.
+        self._dspark_hs_dumper = None
         self.num_draft_tokens = self._make_buffer(self.max_num_reqs, dtype=torch.int32)
         # here we use int32
         self.sampled_token_ids_pinned_cpu = torch.empty(
@@ -2400,6 +2403,27 @@ class NPUModelRunner(GPUModelRunner):
                         self.pcp_manager.get_restore_hidden_states(aux_hidden_states_pcp)
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
+
+            # Plan B: dump DSpark target hidden states (opt-in DSPARK_HS_DUMP=1).
+            # Rides the dspark scratch buffer ([40,41,42], post-layer) + this post-norm
+            # final hidden (verifier-last); no HiddenStateCacheSpec. Last PP rank only
+            # (others still hold IntermediateTensors here). See dspark_hs_dumper.py.
+            if get_pp_group().is_last_rank and not self.is_pooling_model:
+                if self._dspark_hs_dumper is None:
+                    from vllm_ascend.dspark_hs_dumper import DsparkHSDumper
+
+                    self._dspark_hs_dumper = DsparkHSDumper()
+                if self._dspark_hs_dumper.active:
+                    self._dspark_hs_dumper.capture(
+                        scheduler_output=scheduler_output,
+                        input_batch=self.input_batch,
+                        hidden_states=hidden_states,
+                        aux_buffer=getattr(
+                            self.get_model(), "get_mtp_target_hidden_states", lambda: None
+                        )(),
+                        input_ids=self.input_ids.gpu,
+                        num_tokens=scheduler_output.total_num_scheduled_tokens,
+                    )
 
             if not self.broadcast_pp_output:
                 # Common case.
