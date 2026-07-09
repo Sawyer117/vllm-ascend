@@ -56,7 +56,13 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead, VocabParallelEmbedding
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader, maybe_remap_kv_scale_name
-from vllm.model_executor.models.interfaces import MixtureOfExperts, SupportsEagle, SupportsLoRA, SupportsPP
+from vllm.model_executor.models.interfaces import (
+    MixtureOfExperts,
+    SupportsEagle,
+    SupportsEagle3,
+    SupportsLoRA,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     PPMissingLayer,
     is_pp_missing_parameter,
@@ -1187,14 +1193,13 @@ class DeepseekV4Model(nn.Module):
             dtype=vllm_config.model_config.dtype,
             device=self.device,
         )
-        self._dspark_target_layer_ids = list(getattr(config, "dspark_target_layer_ids", []) or [])
-        if self._dspark_target_layer_ids:
-            self._dspark_hidden_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                len(self._dspark_target_layer_ids) * config.hidden_size,
-                dtype=vllm_config.model_config.dtype,
-                device=self.device,
-            )
+        # EAGLE3 / extract_hidden_states aux-output gate. This is the SINGLE,
+        # standard path for emitting target-layer hidden states — used by the
+        # extract_hidden_states connector (offline draft-training data) AND the
+        # in-process DSpark/eagle3 drafts (via the runner's aux -> proposer
+        # wiring). Empty by default; the runner configures it once at load via
+        # set_aux_hidden_state_layers(). Mirrors upstream DeepseekV2Model.
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1234,12 +1239,18 @@ class DeepseekV4Model(nn.Module):
 
         if get_pp_group().is_first_rank:
             hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)  # (b, s, h) -> (b, s, c, h)
-        dspark_hiddens: list[torch.Tensor] = []
-        dspark_target_ids = set(self._dspark_target_layer_ids)
+        # Standard aux capture (the single hidden-state emission path): mean
+        # over the mHC hc_mult streams (hc_post already folds the residual in,
+        # so `hidden_states` is the full residual stream [tokens, hc_mult, h])
+        # -> [tokens, h], at the configured aux layers. Returned as the aux
+        # tuple below and consumed by the extract connector / DSpark/eagle3
+        # proposers via the runner's standard aux wiring.
+        aux_layer_ids = set(self.aux_hidden_state_layers)
+        aux_hidden_states: list[torch.Tensor] = []
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(positions, hidden_states, residual, llama_4_scaling)
-            if layer.layer_idx in dspark_target_ids:
-                dspark_hiddens.append(hidden_states.mean(dim=1))
+            if aux_layer_ids and layer.layer_idx in aux_layer_ids:
+                aux_hidden_states.append(hidden_states.mean(dim=1))
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         # When FlashComm1 (sequence parallelism) is enabled, tokens are
@@ -1261,14 +1272,6 @@ class DeepseekV4Model(nn.Module):
         else:
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
-        if self._dspark_target_layer_ids and dspark_hiddens:
-            dspark_states = torch.cat(dspark_hiddens, dim=-1)
-            if forward_ctx is not None and forward_ctx.flash_comm_v1_enabled:
-                dspark_states = tensor_model_parallel_all_gather(dspark_states, dim=0)
-                pad_size = forward_ctx.pad_size
-                if pad_size > 0:
-                    dspark_states = dspark_states[:-pad_size]
-            self._dspark_hidden_buffer[: dspark_states.shape[0]].copy_(dspark_states)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -1280,6 +1283,12 @@ class DeepseekV4Model(nn.Module):
         hidden_states = self.hc_head(hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
 
         hidden_states = self.norm(hidden_states)
+        # EAGLE3/extract_hidden_states contract: when aux layers are configured,
+        # return (final_hidden, [per-layer aux hidden]); the runner cats over
+        # dim=-1 and slices to scheduled tokens. (PP>1 uses the IntermediateTensors
+        # early-return above; aux for PP>1 is out of scope — our path is PP=1.)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -1346,7 +1355,9 @@ class DeepseekV2MixtureOfExperts(MixtureOfExperts):
             moe.experts.update_expert_map()
 
 
-class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle):
+class AscendDeepseekV4ForCausalLM(
+    nn.Module, SupportsPP, DeepseekV2MixtureOfExperts, SupportsLoRA, SupportsEagle, SupportsEagle3
+):
     packed_modules_mapping = {
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
@@ -1381,6 +1392,22 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
+    # --- SupportsEagle3: aux-hidden-state extraction (eagle3 / extract_hidden_states) ---
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+    def get_eagle3_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        return tuple(self.model.aux_hidden_state_layers)
+
+    def get_eagle3_default_aux_hidden_state_layers(self) -> tuple[int, ...]:
+        # Prefer the model's own DSpark target layers if the config declares
+        # them; else the generic vLLM default (early / mid / late-3).
+        ids = getattr(self.config, "dspark_target_layer_ids", None)
+        if ids:
+            return tuple(ids)
+        n = self.config.num_hidden_layers
+        return (2, n // 2, n - 3)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1410,8 +1437,6 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
         """Pre-hc_head residual stream buffer (max_num_batched_tokens,
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
-        if getattr(self.model, "_dspark_target_layer_ids", None):
-            return getattr(self.model, "_dspark_hidden_buffer", None)
         return getattr(self.model, "_mtp_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
