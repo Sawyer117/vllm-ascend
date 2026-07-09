@@ -46,14 +46,14 @@ logger = init_logger(__name__)
 class DsparkHSDumper:
     """Per-request CPU accumulator + speculators-format writer for DSpark HS.
 
-    On-disk layout of each ``hs_<id>.safetensors`` (the standardized v1 format that
-    ``speculators.train.data.ArrowDataset`` loads directly, no ``standardize_data_v1``
-    needed):
+    On-disk layout of each ``hs_<id>.safetensors`` — the SAME format the standard
+    ``extract_hidden_states`` connector writes, so speculators' ``ArrowDataset`` loads
+    it unchanged (aux = ``hidden_states[:, :-1]``, verifier-last = ``hidden_states[:, -1]``)
+    and takes ``loss_mask`` from the paired rollout dataset, NOT from this file:
 
-        hidden_states               : [seq, num_target_layers * hidden_size]   (aux buffer)
-        verifier_last_hidden_states : [seq, hidden_size]                        (post-norm final)
-        input_ids                   : [seq]                                     (long)
-        loss_mask                   : [seq]                                     (bool)
+        hidden_states : [seq, num_target_layers + 1, hidden_size]  (the aux target layers,
+                        then the verifier-last / final post-norm hidden as the LAST layer)
+        token_ids     : [seq]  (long) — must equal the rollout row's input_ids
     """
 
     def __init__(self) -> None:
@@ -142,19 +142,23 @@ class DsparkHSDumper:
         ent = self._acc.pop(req_id, None)
         if ent is None:
             return
-        aux = torch.cat(ent["aux"], dim=0).contiguous()   # [seq, L_aux*H]
-        last = torch.cat(ent["last"], dim=0).contiguous()  # [seq, H]
+        aux = torch.cat(ent["aux"], dim=0)    # [seq, L_aux*H]  (aux target layers, catted)
+        last = torch.cat(ent["last"], dim=0)  # [seq, H]        (verifier-last / post-norm)
         ids = torch.cat(ent["ids"], dim=0).to(torch.long).contiguous()  # [seq]
         seq = int(ids.shape[0])
+        h = last.shape[1]
+        num_aux = aux.shape[1] // h
+        # Stack the aux target layers + the verifier-last as the LAST layer ->
+        # [seq, num_aux + 1, h]. This is exactly what the extract_hidden_states
+        # connector writes, so ArrowDataset reads it unchanged; loss_mask comes from
+        # the paired rollout dataset (offline.check_hidden_states validates token_ids).
+        stacked = torch.cat(
+            [aux.reshape(seq, num_aux, h), last.reshape(seq, 1, h)], dim=1
+        ).contiguous()  # [seq, num_aux + 1, h]
 
         data = {
-            "hidden_states": aux,
-            "verifier_last_hidden_states": last,
-            "input_ids": ids,
-            # P1: train on all positions. The prompt/response split (loss_mask=0 on the
-            # prompt) is an open item (planB doc §8.4) — the driving client knows each
-            # rollout row's split and can refine this. All-ones is a safe placeholder.
-            "loss_mask": torch.ones(seq, dtype=torch.bool),
+            "hidden_states": stacked,
+            "token_ids": ids,
         }
 
         stem = self._stem(req_id)
@@ -167,8 +171,8 @@ class DsparkHSDumper:
         self._written += 1
         if self._written <= 3 or self._written % 200 == 0:
             logger.info(
-                "DsparkHSDumper wrote %s (seq=%d, hidden_states=%s, verifier_last=%s) [#%d]",
-                os.path.basename(final), seq, tuple(aux.shape), tuple(last.shape), self._written,
+                "DsparkHSDumper wrote %s (seq=%d, hidden_states=%s [aux+verifier_last], token_ids=%d) [#%d]",
+                os.path.basename(final), seq, tuple(stacked.shape), seq, self._written,
             )
 
     @staticmethod
