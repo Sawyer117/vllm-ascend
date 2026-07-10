@@ -82,6 +82,14 @@ class DsparkHSDumper:
                     "hidden_states output directory."
                 )
             os.makedirs(self.out_dir, exist_ok=True)
+            # The online trainer runs as a DIFFERENT uid than the serve (cross-node NFS
+            # uid mapping) yet must unlink each file after reading it (on_generate="delete"
+            # rolling buffer). A 0775 dir only lets the owner/group delete, so open the dir
+            # to any uid. Owner-only op (we just created/own it); best-effort.
+            try:
+                os.chmod(self.out_dir, 0o777)
+            except OSError as e:  # pragma: no cover
+                logger.warning("DsparkHSDumper could not chmod %s to 0777: %s", self.out_dir, e)
             logger.info("DsparkHSDumper active: writing hs_<id>.safetensors to %s", self.out_dir)
 
     @property
@@ -168,6 +176,16 @@ class DsparkHSDumper:
         # Write to a temp file then rename so a rolling-buffer reader never sees a
         # partial file (the online trainer streams these with on_missing="generate").
         save_file(data, tmp)
+        # Pin 0777 BEFORE the atomic rename. save_file honors the worker process umask,
+        # which is 077 under the vLLM spawn launcher -> 0600, making the file unreadable to
+        # the trainer's (different, cross-node NFS-mapped) uid. These are ephemeral scratch
+        # files written/read/unlinked in a rolling buffer, so open them wide (any uid r/w);
+        # chmod the temp so `final` appears world-accessible the instant os.replace makes it
+        # visible (no restrictive-mode window at the real path).
+        try:
+            os.chmod(tmp, 0o777)
+        except OSError as e:  # pragma: no cover
+            logger.warning("DsparkHSDumper could not chmod %s to 0777: %s", tmp, e)
         os.replace(tmp, final)
         self._written += 1
         if self._written <= 3 or self._written % 200 == 0:
