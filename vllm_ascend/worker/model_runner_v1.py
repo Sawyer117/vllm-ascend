@@ -2589,6 +2589,22 @@ class NPUModelRunner(GPUModelRunner):
                         for aux_hidden_states_pcp in aux_hidden_states
                     ]
 
+            # Plan B: dump DSpark target hidden states (opt-in DSPARK_HS_DUMP=1) — reads the dspark scratch
+            # buffer ([40,41,42], post-layer mean-over-mHC) via get_mtp_target_hidden_states() + this post-norm
+            # final hidden. No HiddenStateCacheSpec. Last PP rank only. See vllm_ascend/dspark_hs_dumper.py.
+            if get_pp_group().is_last_rank and not self.is_pooling_model:
+                if getattr(self, "_dspark_hs_dumper", None) is None:
+                    from vllm_ascend.dspark_hs_dumper import DsparkHSDumper
+                    self._dspark_hs_dumper = DsparkHSDumper()
+                if self._dspark_hs_dumper.active:
+                    self._dspark_hs_dumper.capture(
+                        scheduler_output=scheduler_output,
+                        input_batch=self.input_batch,
+                        hidden_states=hidden_states,
+                        aux_buffer=getattr(self.get_model(), "get_mtp_target_hidden_states", lambda: None)(),
+                        input_ids=self.input_ids.gpu,
+                        num_tokens=scheduler_output.total_num_scheduled_tokens,
+                    )
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
