@@ -247,6 +247,14 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
         if table is None:
             raise ValueError(f"DSpark requires a block table for draft cache group {gid}")
         table = table[:batch_size]
+        if table.shape[0] < batch_size:
+            # DP-idle dummy batch: the runner block table holds fewer real rows than the
+            # DP-padded request count (model_num_reqs). Zero-pad up to batch_size so the
+            # graph-buffer copy below matches, mirroring _pad_request_rows; the padded rows
+            # are empty block tables for the dummy padding requests and touch no real data.
+            padded = table.new_zeros((batch_size, *table.shape[1:]))
+            padded[: table.shape[0]].copy_(table)
+            table = padded
         if not getattr(self, "use_cuda_graph", False):
             return table
         buffer = self._block_table_buffers.get(gid)
