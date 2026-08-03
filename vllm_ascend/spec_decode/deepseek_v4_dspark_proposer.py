@@ -649,6 +649,40 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
             self._draft_buffer[:num_reqs, step].copy_(draft_ids)
             prev_ids = self._draft_buffer[:num_reqs, step]
         self._last_draft_logits = None if draft_logits is None else draft_logits.contiguous()
+        # ── T6 forward-parity dump (env-gated, N-block; DEAD CODE unless DSPARK_PARITY_DUMP=1) ──
+        # Run the serve with DSPARK_PARITY_DUMP=1 (+DSPARK_PARITY_N / DSPARK_PARITY_DIR) and send
+        # ONE request (batch_size==1); each step writes serve_block_<i>.pt for
+        # examples/ascend_npu_dflash/dsv4_dspark_forward_parity_v2.py. Side-effect-free otherwise.
+        import os as _os
+        if _os.environ.get("DSPARK_PARITY_DUMP") == "1":
+            _cnt = getattr(self, "_parity_count", 0)
+            _N = int(_os.environ.get("DSPARK_PARITY_N", "32"))
+            if _cnt < _N and int(getattr(self, "_dflash_num_context", 0)) > 0:
+                self._parity_count = _cnt + 1
+                import torch as _torch
+                _dir = _os.environ.get("DSPARK_PARITY_DIR", "/tmp/dspark_parity")
+                _os.makedirs(_dir, exist_ok=True)
+                _nctx = int(self._dflash_num_context)
+                _seed = self._seed_buffer[0]
+                _final, _prev = [], _seed
+                for _s in range(self.block_size):
+                    _lg = base_logits[0, _s] + self.model.markov_bias(self.model.markov_embed(_prev.view(1)))[0]
+                    _final.append(_lg.detach().float().cpu())
+                    _prev = self._draft_buffer[0, _s]
+                _torch.save({
+                    "aux": self._dflash_hidden_states[:_nctx].detach().float().cpu(),
+                    "ctx_positions": self._context_positions_buffer[:_nctx].detach().cpu(),
+                    "anchor_token": int(_seed.item()),
+                    "draft_positions": self.positions[:self.block_size].detach().cpu(),
+                    "serve_base_logits": base_logits[0].detach().float().cpu(),
+                    "serve_final_logits": _torch.stack(_final),
+                    "drafted": self._draft_buffer[0, :self.block_size].detach().cpu(),
+                    "block_size": int(self.block_size),
+                    "dspark_noise_token_id": int(self.parallel_drafting_token_id),
+                }, _os.path.join(_dir, f"serve_block_{_cnt}.pt"))
+                if _cnt + 1 == _N:
+                    print(f">>> [DSPARK_PARITY_DUMP] wrote {_N} blocks to {_dir}", flush=True)
+        # ────────────────────────────────────────────────────────────────────────────────────
         return self._draft_buffer[:num_reqs]
 
     def _propose(
