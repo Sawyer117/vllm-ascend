@@ -674,10 +674,12 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
                 }, _os.path.join(_dir, f"serve_block_{_cnt}.pt"))
                 # DSPARK_SATDUMP: for the FIRST block, also write model.forward's stashed per-stage
                 # capture — GUARANTEED the same forward as serve_block_0.pt (the model just ran it).
-                if _cnt == 0 and _os.environ.get("DSPARK_SATDUMP") == "1" and hasattr(self.model, "_sat_rec"):
+                # The stash lives on the INNER DeepseekV4DSparkModel (self.model is the MTP wrapper).
+                _inner = getattr(self.model, "model", self.model)
+                if _cnt == 0 and _os.environ.get("DSPARK_SATDUMP") == "1" and hasattr(_inner, "_sat_rec"):
                     _sdir = _os.environ.get("DSPARK_SATDUMP_DIR", _dir)
                     _os.makedirs(_sdir, exist_ok=True)
-                    _torch.save(self.model._sat_rec, _os.path.join(_sdir, "serve_sat.pt"))
+                    _torch.save(_inner._sat_rec, _os.path.join(_sdir, "serve_sat.pt"))
                     print(f">>> [DSPARK_SATDUMP] serve (aligned to serve_block_0) → {_sdir}/serve_sat.pt", flush=True)
                 if _cnt + 1 == _N:
                     print(f">>> [DSPARK_PARITY_DUMP] wrote {_N} blocks to {_dir}", flush=True)
