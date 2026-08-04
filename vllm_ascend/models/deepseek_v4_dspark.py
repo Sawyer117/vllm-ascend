@@ -160,6 +160,12 @@ class DSparkMarkovHead(nn.Module):
         return self.logits_processor(self.markov_w2, markov_embed)
 
 
+# DSPARK_SATDUMP arm flag — the proposer sets this True right before the DRAFT forward on a
+# REAL block (_dflash_num_context>0), so model.forward's satdump captures that block (NOT a
+# warmup/profiling dummy forward). Same real-block gate as the PIECE-1 parity dump.
+_SAT_ARM = False
+
+
 class DeepseekV4DSparkModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -290,7 +296,8 @@ class DeepseekV4DSparkModel(nn.Module):
         #    stage. Corresponds to the same block as the _sample_sequential PIECE-1 dump
         #    (both one-shot on the first spec-decode block). Side-effect-free when unset.
         import os as _os
-        _sat = _os.environ.get("DSPARK_SATDUMP") == "1" and not getattr(self, "_satdumped", False)
+        _sat = (_os.environ.get("DSPARK_SATDUMP") == "1" and _SAT_ARM
+                and not getattr(self, "_satdumped", False))
         _rec = {"embed": inputs_embeds.detach().float().cpu(),
                 "streams_in": hidden_states.detach().float().cpu(),
                 "positions": positions.detach().cpu(), "layers": []} if _sat else None

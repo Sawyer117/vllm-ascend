@@ -740,6 +740,12 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
         num_input_tokens = self._pad_request_rows(cad, actual_num_reqs, model_num_reqs)
         attn_metadata = self._build_attn_metadata(cad)
         self._precompute_context_kv()
+        # DSPARK_SATDUMP: arm the model.forward per-stage dump for THIS real block only
+        # (num_context>0 = same gate as the PIECE-1 parity dump; skips warmup/dummy forwards).
+        import os as _os  # noqa: PLC0415
+        if _os.environ.get("DSPARK_SATDUMP") == "1" and int(getattr(self, "_dflash_num_context", 0)) > 0:
+            from vllm_ascend.models import deepseek_v4_dspark as _dsp  # noqa: PLC0415
+            _dsp._SAT_ARM = True
         with set_ascend_forward_context(
             attn_metadata[0],
             self.vllm_config,
