@@ -160,12 +160,6 @@ class DSparkMarkovHead(nn.Module):
         return self.logits_processor(self.markov_w2, markov_embed)
 
 
-# DSPARK_SATDUMP arm flag — the proposer sets this True right before the DRAFT forward on a
-# REAL block (_dflash_num_context>0), so model.forward's satdump captures that block (NOT a
-# warmup/profiling dummy forward). Same real-block gate as the PIECE-1 parity dump.
-_SAT_ARM = False
-
-
 class DeepseekV4DSparkModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -291,13 +285,13 @@ class DeepseekV4DSparkModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
-        # ── DSPARK_SATDUMP=1: one-shot SATURATED per-stage dump of the block forward, so a
-        #    matching train-side dump can be bisected layer-by-layer to the FIRST diverging
-        #    stage. Corresponds to the same block as the _sample_sequential PIECE-1 dump
-        #    (both one-shot on the first spec-decode block). Side-effect-free when unset.
+        # ── DSPARK_SATDUMP=1: STASH the per-stage capture of EVERY draft block forward onto
+        #    self._sat_rec (overwrite; keep only the latest). The proposer's PIECE-1 parity dump
+        #    then writes THIS stash as serve_sat.pt for the exact block it dumps — guaranteeing
+        #    serve_sat.pt and serve_block_0.pt are the SAME forward (the old _SAT_ARM one-shot
+        #    misfired one step late on the graph/warmup path). Side-effect-free when unset.
         import os as _os
-        _sat = (_os.environ.get("DSPARK_SATDUMP") == "1" and _SAT_ARM
-                and not getattr(self, "_satdumped", False))
+        _sat = _os.environ.get("DSPARK_SATDUMP") == "1"
         _rec = {"embed": inputs_embeds.detach().float().cpu(),
                 "streams_in": hidden_states.detach().float().cpu(),
                 "positions": positions.detach().cpu(), "layers": []} if _sat else None
@@ -317,15 +311,10 @@ class DeepseekV4DSparkModel(nn.Module):
             self.config.hc_eps,
         )
         if _sat:
-            self._satdumped = True
             _rec["hc_head_out"] = out.detach().float().cpu()
             _rec["substages"] = _dsv4mod._SAT_SUB
             _dsv4mod._SAT_SUB = None
-            _dir = _os.environ.get("DSPARK_SATDUMP_DIR", "/tmp/dspark_sat")
-            _os.makedirs(_dir, exist_ok=True)
-            torch.save(_rec, _os.path.join(_dir, "serve_sat.pt"))
-            print(f">>> [DSPARK_SATDUMP] serve: embed + {len(_rec['layers'])} layers "
-                  f"({len(_rec['substages'])} sub-staged) + hc_head → {_dir}/serve_sat.pt", flush=True)
+            self._sat_rec = _rec  # PIECE-1 (proposer) writes this for the block it dumps
         return out
 
     def compute_logits(

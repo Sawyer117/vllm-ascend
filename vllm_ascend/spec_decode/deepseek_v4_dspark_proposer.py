@@ -672,6 +672,13 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
                     "block_size": int(self.block_size),
                     "dspark_noise_token_id": int(self.parallel_drafting_token_id),
                 }, _os.path.join(_dir, f"serve_block_{_cnt}.pt"))
+                # DSPARK_SATDUMP: for the FIRST block, also write model.forward's stashed per-stage
+                # capture — GUARANTEED the same forward as serve_block_0.pt (the model just ran it).
+                if _cnt == 0 and _os.environ.get("DSPARK_SATDUMP") == "1" and hasattr(self.model, "_sat_rec"):
+                    _sdir = _os.environ.get("DSPARK_SATDUMP_DIR", _dir)
+                    _os.makedirs(_sdir, exist_ok=True)
+                    _torch.save(self.model._sat_rec, _os.path.join(_sdir, "serve_sat.pt"))
+                    print(f">>> [DSPARK_SATDUMP] serve (aligned to serve_block_0) → {_sdir}/serve_sat.pt", flush=True)
                 if _cnt + 1 == _N:
                     print(f">>> [DSPARK_PARITY_DUMP] wrote {_N} blocks to {_dir}", flush=True)
         # ────────────────────────────────────────────────────────────────────────────────────
@@ -740,12 +747,6 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
         num_input_tokens = self._pad_request_rows(cad, actual_num_reqs, model_num_reqs)
         attn_metadata = self._build_attn_metadata(cad)
         self._precompute_context_kv()
-        # DSPARK_SATDUMP: arm the model.forward per-stage dump for THIS real block only
-        # (num_context>0 = same gate as the PIECE-1 parity dump; skips warmup/dummy forwards).
-        import os as _os  # noqa: PLC0415
-        if _os.environ.get("DSPARK_SATDUMP") == "1" and int(getattr(self, "_dflash_num_context", 0)) > 0:
-            from vllm_ascend.models import deepseek_v4_dspark as _dsp  # noqa: PLC0415
-            _dsp._SAT_ARM = True
         with set_ascend_forward_context(
             attn_metadata[0],
             self.vllm_config,
