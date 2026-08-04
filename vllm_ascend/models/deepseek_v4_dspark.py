@@ -285,9 +285,20 @@ class DeepseekV4DSparkModel(nn.Module):
         if inputs_embeds is None:
             inputs_embeds = self.embed_input_ids(input_ids)
         hidden_states = inputs_embeds.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        # ── DSPARK_SATDUMP=1: one-shot SATURATED per-stage dump of the block forward, so a
+        #    matching train-side dump can be bisected layer-by-layer to the FIRST diverging
+        #    stage. Corresponds to the same block as the _sample_sequential PIECE-1 dump
+        #    (both one-shot on the first spec-decode block). Side-effect-free when unset.
+        import os as _os
+        _sat = _os.environ.get("DSPARK_SATDUMP") == "1" and not getattr(self, "_satdumped", False)
+        _rec = {"embed": inputs_embeds.detach().float().cpu(),
+                "streams_in": hidden_states.detach().float().cpu(),
+                "positions": positions.detach().cpu(), "layers": []} if _sat else None
         for layer in self.layers.values():
             hidden_states, _ = layer(positions, hidden_states, None)
-        return _hc_head(
+            if _sat:
+                _rec["layers"].append(hidden_states.detach().float().cpu())
+        out = _hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,
@@ -295,6 +306,15 @@ class DeepseekV4DSparkModel(nn.Module):
             self.config.rms_norm_eps,
             self.config.hc_eps,
         )
+        if _sat:
+            self._satdumped = True
+            _rec["hc_head_out"] = out.detach().float().cpu()
+            _dir = _os.environ.get("DSPARK_SATDUMP_DIR", "/tmp/dspark_sat")
+            _os.makedirs(_dir, exist_ok=True)
+            torch.save(_rec, _os.path.join(_dir, "serve_sat.pt"))
+            print(f">>> [DSPARK_SATDUMP] serve: embed + {len(_rec['layers'])} layers + hc_head "
+                  f"→ {_dir}/serve_sat.pt", flush=True)
+        return out
 
     def compute_logits(
         self,
