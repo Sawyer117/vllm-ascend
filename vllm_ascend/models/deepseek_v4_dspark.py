@@ -294,6 +294,9 @@ class DeepseekV4DSparkModel(nn.Module):
         _rec = {"embed": inputs_embeds.detach().float().cpu(),
                 "streams_in": hidden_states.detach().float().cpu(),
                 "positions": positions.detach().cpu(), "layers": []} if _sat else None
+        if _sat:
+            from vllm_ascend.models import deepseek_v4 as _dsv4mod
+            _dsv4mod._SAT_SUB = []  # arm per-sub-stage capture for the DRAFT layers only
         for layer in self.layers.values():
             hidden_states, _ = layer(positions, hidden_states, None)
             if _sat:
@@ -309,11 +312,13 @@ class DeepseekV4DSparkModel(nn.Module):
         if _sat:
             self._satdumped = True
             _rec["hc_head_out"] = out.detach().float().cpu()
+            _rec["substages"] = _dsv4mod._SAT_SUB
+            _dsv4mod._SAT_SUB = None
             _dir = _os.environ.get("DSPARK_SATDUMP_DIR", "/tmp/dspark_sat")
             _os.makedirs(_dir, exist_ok=True)
             torch.save(_rec, _os.path.join(_dir, "serve_sat.pt"))
-            print(f">>> [DSPARK_SATDUMP] serve: embed + {len(_rec['layers'])} layers + hc_head "
-                  f"→ {_dir}/serve_sat.pt", flush=True)
+            print(f">>> [DSPARK_SATDUMP] serve: embed + {len(_rec['layers'])} layers "
+                  f"({len(_rec['substages'])} sub-staged) + hc_head → {_dir}/serve_sat.pt", flush=True)
         return out
 
     def compute_logits(

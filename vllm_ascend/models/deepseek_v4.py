@@ -917,6 +917,12 @@ class DeepseekV4Attention(nn.Module):
         return self.dsa_attn(positions, hidden_states, llama_4_scaling)
 
 
+# DSPARK_SATDUMP intra-layer capture: DeepseekV4DSparkModel.forward sets this to a list
+# during its (one-shot) satdump window; each decoder layer then appends its per-sub-stage
+# tensors. Left None everywhere else (target 43-layer forward), so this is a pure no-op.
+_SAT_SUB = None
+
+
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -995,17 +1001,28 @@ class DeepseekV2DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
         llama_4_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        _sub = {} if _SAT_SUB is not None else None
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+        if _sub is not None: _sub["hc_pre_attn"] = hidden_states.detach().float().cpu()
         hidden_states = self.input_layernorm(hidden_states)
+        if _sub is not None: _sub["attn_norm"] = hidden_states.detach().float().cpu()
         attn_kwargs = {"positions": positions, "hidden_states": hidden_states, "llama_4_scaling": llama_4_scaling}
         hidden_states = self.self_attn(**attn_kwargs)
+        if _sub is not None: _sub["attn_out"] = hidden_states.detach().float().cpu()
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        if _sub is not None: _sub["post_attn"] = hidden_states.detach().float().cpu()
         residual = hidden_states.clone()
         hidden_states, post, comb = self.hc_pre(hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base)
+        if _sub is not None: _sub["hc_pre_ffn"] = hidden_states.detach().float().cpu()
         hidden_states = self.post_attention_layernorm(hidden_states)
+        if _sub is not None: _sub["ffn_norm"] = hidden_states.detach().float().cpu()
         hidden_states = self.mlp(hidden_states)
+        if _sub is not None: _sub["moe_out"] = hidden_states.detach().float().cpu()
         hidden_states = self.hc_post(hidden_states, residual, post, comb)
+        if _sub is not None:
+            _sub["layer_out"] = hidden_states.detach().float().cpu()
+            _SAT_SUB.append(_sub)
 
         return hidden_states, residual
 
