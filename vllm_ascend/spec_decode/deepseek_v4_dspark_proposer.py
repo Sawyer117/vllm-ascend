@@ -789,6 +789,32 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
     #
     # ENV: DSPARK_VITERBI_K=4   (0/1/unset -> off, byte-identical to the greedy path)
     # ──────────────────────────────────────────────────────────────────────────────
+    # THREE DECODERS, one lattice. All read the same scores; they differ only in what
+    # they maximise, and that difference is the experiment:
+    #
+    #   greedy   (DSPARK_VITERBI_MODE=greedy) -- walk the lattice forward, take the best
+    #            successor at each step. This is what the DFlash2 post actually describes
+    #            ("starting from the last verified token, greedy follows the best
+    #            successor"), so it is the faithful baseline: it isolates the value of
+    #            having K candidates at all, without the global optimisation.
+    #
+    #   viterbi  (default) -- exact max-total-score path. Strictly stronger as an
+    #            optimiser, but ⚠ NOT obviously better here: the serve accepts a PREFIX,
+    #            so the quantity that pays is E[accepted] = Σ_t P(positions 0..t all
+    #            correct), not the block's total chain score. A path that sacrifices
+    #            pos0 to win big at pos3/4 scores higher and earns nothing. Prefix
+    #            semantics weight early positions; forward-greedy happens to do the same.
+    #            If viterbi ties or loses to greedy, that is objective mismatch, not a bug.
+    #
+    #   decay    (DSPARK_VITERBI_MODE=decay) -- viterbi with the per-position weights the
+    #            TRAINING loss already uses, w_t = exp(-t/gamma) with gamma=4 (the DSpark
+    #            default, `--dflash-decay-gamma`). Down-weighting late positions is the
+    #            cheap way to encode "early positions pay more" into a decomposable score,
+    #            so the DP still applies unchanged. Of the three this is the closest proxy
+    #            for E[accepted], and it is the one we expect to win if any does.
+    #
+    # Same lattice, same transitions, ~same cost -- so one serve run can measure all three
+    # by flipping an env var, which matters because eval machines are the scarce resource.
     def _viterbi_k(self) -> int:
         k = getattr(self, "_vk", None)
         if k is None:
@@ -796,10 +822,17 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
 
             k = int(_os.environ.get("DSPARK_VITERBI_K", "0"))
             self._vk = k
+            self._vmode = _os.environ.get("DSPARK_VITERBI_MODE", "viterbi").lower()
+            self._vgamma = float(_os.environ.get("DSPARK_VITERBI_GAMMA", "4.0"))
+            if self._vmode not in ("viterbi", "greedy", "decay"):
+                raise ValueError(
+                    f"DSPARK_VITERBI_MODE={self._vmode!r}: expected viterbi | greedy | decay"
+                )
             if k > 1:
+                extra = f" gamma={self._vgamma}" if self._vmode == "decay" else ""
                 print(
-                    f">>> [DSPARK_VITERBI] joint decoding over the existing Markov chain, K={k} "
-                    f"(zero new parameters; greedy paths only)",
+                    f">>> [DSPARK_VITERBI] joint decoding over the existing Markov chain, "
+                    f"K={k} mode={self._vmode}{extra} (zero new parameters; greedy paths only)",
                     flush=True,
                 )
         return k
@@ -814,6 +847,13 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
         top-k per position), so the lattice does not depend on the path being scored.
         """
         R, T = num_reqs, self.block_size
+        mode = getattr(self, "_vmode", "viterbi")
+        gamma = getattr(self, "_vgamma", 4.0)
+        # Per-position weights. "decay" mirrors the training loss (w_t = exp(-t/gamma),
+        # DSpark default gamma=4) so the decoder optimises roughly what prefix acceptance
+        # pays for; the other two weight every position equally.
+        w = [1.0] * T if mode != "decay" else [float(torch.exp(torch.tensor(-t / gamma))) for t in range(T)]
+
         # Unary: the k candidates per position, and their own logits. One topk for the
         # whole block rather than per step.
         cand_val, cand_id = base_logits.topk(k, dim=-1)  # [R, T, k]
@@ -822,21 +862,49 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
         # request, so this is exactly today's first iteration, restricted to the
         # candidates.
         bias0 = self.model.markov_bias(self.model.markov_embed(self._seed_buffer[:R]))  # [R, V]
-        score = cand_val[:, 0] + bias0.gather(1, cand_id[:, 0])  # [R, k]
+        score = (cand_val[:, 0] + bias0.gather(1, cand_id[:, 0])) * w[0]  # [R, k]
         back = torch.empty((R, T, k), dtype=torch.long, device=base_logits.device)
         back[:, 0] = 0
 
+        # "greedy" commits position by position (the DFlash2 walk); the DP modes keep all
+        # k states alive and settle at the end. Both need the same transition rows, so the
+        # only divergence is which predecessor survives into the next step.
+        if mode == "greedy":
+            j = score.argmax(dim=-1)  # [R] chosen state at t=0
+
         for t in range(1, T):
-            prev_ids = cand_id[:, t - 1].reshape(-1)  # [R*k]
-            bias = self.model.markov_bias(self.model.markov_embed(prev_ids))  # [R*k, V]
+            prev_state = j if mode == "greedy" else None
+            if prev_state is None:
+                prev_ids = cand_id[:, t - 1].reshape(-1)  # [R*k] every predecessor
+                n_prev = k
+            else:
+                prev_ids = cand_id[:, t - 1].gather(1, prev_state.unsqueeze(1)).reshape(-1)  # [R]
+                n_prev = 1
+            bias = self.model.markov_bias(self.model.markov_embed(prev_ids))  # [R*n_prev, V]
             # transition[r, i, j] = bias(cand[t-1][i])[cand[t][j]]
             trans = bias.gather(
-                1, cand_id[:, t].unsqueeze(1).expand(R, k, k).reshape(R * k, k)
-            ).view(R, k, k)
-            total = score.unsqueeze(2) + trans  # [R, k(prev), k(cur)]
-            best, arg = total.max(dim=1)  # over the predecessor
-            score = best + cand_val[:, t]
-            back[:, t] = arg
+                1, cand_id[:, t].unsqueeze(1).expand(R, n_prev, k).reshape(R * n_prev, k)
+            ).view(R, n_prev, k)
+            step_score = (cand_val[:, t].unsqueeze(1) + trans) * w[t]  # [R, n_prev, k]
+            if mode == "greedy":
+                # Committed predecessor: pick this position's best successor and move on.
+                j = step_score.squeeze(1).argmax(dim=-1)
+                back[:, t] = 0
+                score = step_score.squeeze(1)  # only for shape/debug symmetry
+                out_j = j
+                if t == 1:
+                    greedy_ids = [cand_id[:, 0].gather(1, prev_state.unsqueeze(1)).squeeze(1)]
+                greedy_ids.append(cand_id[:, t].gather(1, out_j.unsqueeze(1)).squeeze(1))
+            else:
+                total = score.unsqueeze(2) + step_score  # [R, k(prev), k(cur)]
+                best, arg = total.max(dim=1)  # over the predecessor
+                score = best
+                back[:, t] = arg
+
+        if mode == "greedy":
+            if T == 1:
+                greedy_ids = [cand_id[:, 0].gather(1, j.unsqueeze(1)).squeeze(1)]
+            return torch.stack(greedy_ids, dim=1)
 
         # Walk the backpointers from the best final state.
         out = torch.empty((R, T), dtype=cand_id.dtype, device=cand_id.device)
