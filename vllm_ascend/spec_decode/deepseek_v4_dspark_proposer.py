@@ -742,6 +742,110 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
             state["cand"] = []
             state["verify"] = []
 
+    # ──────────────────────────────────────────────────────────────────────────────
+    # DSPARK_VITERBI_K — zero-parameter joint decoding over the EXISTING Markov chain.
+    # DEAD CODE unless the env is set to >1.
+    #
+    # WHY THIS IS FREE. The drafter already scores a first-order chain: every step of
+    # _sample_sequential computes
+    #     logits_t = base_logits[:, t] + markov_bias(markov_embed(prev))
+    # i.e. a unary term (the draft's own logit for a token) plus a transition term
+    # (compatibility with the token chosen at t-1). The transition is exactly the
+    # low-rank bilinear form DFlash2's path selector learns from scratch:
+    #     bias(a)[b] = markov_w1(a) · markov_w2.weight[b]      (rank 256)
+    # What we do NOT do today is decode it jointly: the loop commits argmax at each
+    # step, so a locally-attractive token that strangles every continuation is never
+    # revisited. Viterbi over the same scores fixes that with NO new weights and NO
+    # training -- it is the "joint decoding" half of path selection, isolated.
+    #
+    # WHY IT IS WORTH TRYING. The training-side probe measured the selection headroom
+    # on ep5p0-ropefix: at the last block position the target token is inside the
+    # draft's top-16 84.6% of the time but argmax picks it only 58.1% -- 26.4 points
+    # thrown away by greedy commitment, and hard 3.845 vs oracle@16 5.309 (+1.46
+    # tokens). The same probe showed k=4 already recovers 60% of that gap, which is
+    # why K defaults small: the per-step cost scales with K.
+    #
+    # WHAT THIS IS NOT. The oracle assumes perfect selection; Viterbi only maximises
+    # the model's own chain score, so it recovers a fraction of the headroom. And the
+    # learned context gate H(h_t) -- the other half of DFlash2's selector -- is absent
+    # here by construction. A flat result therefore localises the value in H, which is
+    # exactly the question this experiment exists to answer.
+    #
+    # COST. Today: block_size bias() calls at batch num_reqs. Here: one at batch
+    # num_reqs (step 0, single known predecessor = the verified anchor) plus
+    # block_size-1 at batch num_reqs*K, since each of the K predecessor candidates
+    # needs its own transition row. Using the model's own markov_bias() keeps this
+    # correct under tensor parallelism (ParallelLMHead shards the vocab; the
+    # logits_processor gathers) at the price of materialising the full vocabulary and
+    # then keeping K columns. If latency proves to be the blocker, the exact
+    # optimisation is to gather the K rows of markov_w2.weight instead -- O(K*K*rank)
+    # per request rather than O(K*vocab) -- which needs TP-aware row indexing.
+    #
+    # Greedy only: with sampling the chain score is not the objective, and the
+    # losslessness argument would need the rejection-sampling machinery DFlash2 does
+    # not publish. Shapes are fixed (always num_reqs x block_size x K), so this adds
+    # nothing the ACLGraph could object to -- and _sample_sequential is outside the
+    # captured graph anyway (see the DSPARK_TOPK_DUMP note above).
+    #
+    # ENV: DSPARK_VITERBI_K=4   (0/1/unset -> off, byte-identical to the greedy path)
+    # ──────────────────────────────────────────────────────────────────────────────
+    def _viterbi_k(self) -> int:
+        k = getattr(self, "_vk", None)
+        if k is None:
+            import os as _os
+
+            k = int(_os.environ.get("DSPARK_VITERBI_K", "0"))
+            self._vk = k
+            if k > 1:
+                print(
+                    f">>> [DSPARK_VITERBI] joint decoding over the existing Markov chain, K={k} "
+                    f"(zero new parameters; greedy paths only)",
+                    flush=True,
+                )
+        return k
+
+    def _sample_viterbi(self, base_logits: torch.Tensor, num_reqs: int, k: int) -> torch.Tensor:
+        """Best path through the K-candidate lattice under the draft's own chain score.
+
+        base_logits: [num_reqs, block_size, vocab] -- the unary term U_t(.).
+        Returns [num_reqs, block_size] token ids, same contract as the greedy loop.
+
+        Candidates come from the unary term alone (as in DFlash2: the drafter's own
+        top-k per position), so the lattice does not depend on the path being scored.
+        """
+        R, T = num_reqs, self.block_size
+        # Unary: the k candidates per position, and their own logits. One topk for the
+        # whole block rather than per step.
+        cand_val, cand_id = base_logits.topk(k, dim=-1)  # [R, T, k]
+
+        # t=0: the predecessor is the verified anchor -- a single known token per
+        # request, so this is exactly today's first iteration, restricted to the
+        # candidates.
+        bias0 = self.model.markov_bias(self.model.markov_embed(self._seed_buffer[:R]))  # [R, V]
+        score = cand_val[:, 0] + bias0.gather(1, cand_id[:, 0])  # [R, k]
+        back = torch.empty((R, T, k), dtype=torch.long, device=base_logits.device)
+        back[:, 0] = 0
+
+        for t in range(1, T):
+            prev_ids = cand_id[:, t - 1].reshape(-1)  # [R*k]
+            bias = self.model.markov_bias(self.model.markov_embed(prev_ids))  # [R*k, V]
+            # transition[r, i, j] = bias(cand[t-1][i])[cand[t][j]]
+            trans = bias.gather(
+                1, cand_id[:, t].unsqueeze(1).expand(R, k, k).reshape(R * k, k)
+            ).view(R, k, k)
+            total = score.unsqueeze(2) + trans  # [R, k(prev), k(cur)]
+            best, arg = total.max(dim=1)  # over the predecessor
+            score = best + cand_val[:, t]
+            back[:, t] = arg
+
+        # Walk the backpointers from the best final state.
+        out = torch.empty((R, T), dtype=cand_id.dtype, device=cand_id.device)
+        j = score.argmax(dim=-1)  # [R]
+        for t in range(T - 1, -1, -1):
+            out[:, t] = cand_id[:, t].gather(1, j.unsqueeze(1)).squeeze(1)
+            j = back[:, t].gather(1, j.unsqueeze(1)).squeeze(1)
+        return out
+
     def _sample_sequential(
         self,
         hidden_states: torch.Tensor,
@@ -769,6 +873,17 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
         # picked the wrong token, was the target's token among the candidates?
         # See _topk_dump_record() for the contract; nothing here runs when off.
         _tk_buf = self._topk_dump_open(num_reqs)
+
+        # Joint decoding over the same chain the loop below scores step by step.
+        # Inert unless DSPARK_VITERBI_K>1; skipped under sampling, where the chain
+        # score is not the objective.
+        _vk = self._viterbi_k()
+        if _vk > 1 and not probabilistic and _tk_buf is None:
+            self._draft_buffer[:num_reqs, : self.block_size].copy_(
+                self._sample_viterbi(base_logits, num_reqs, _vk)
+            )
+            self._last_draft_logits = None
+            return self._draft_buffer[:num_reqs]
 
         for step in range(self.block_size):
             logits = base_logits[:, step] + self.model.markov_bias(self.model.markov_embed(prev_ids))
