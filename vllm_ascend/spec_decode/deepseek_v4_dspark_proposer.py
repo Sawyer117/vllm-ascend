@@ -349,6 +349,13 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
             group.kv_cache_group_id: self._get_block_table(group.kv_cache_group_id, cad, batch_size)
             for group in self.draft_attn_groups
         }
+        # DSPARK_TOPK_DUMP: this round's correction/rejection describes the block drafted
+        # LAST round -- that offset is the join key. Inert unless the env is "1".
+        self._topk_dump_note_verify(
+            next_token_ids,
+            effective_rejected_tokens if effective_rejected_tokens is not None else rejected_cpu,
+            batch_size,
+        )
         self._seed_buffer[:batch_size].copy_(next_token_ids[:batch_size])
         context_cursor = 0
         for req_idx in range(batch_size):
@@ -597,6 +604,144 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
             out[req_idx] = generator.initial_seed() if generator is not None else base_seed + req_idx * 9973
         return out
 
+    # ──────────────────────────────────────────────────────────────────────────────
+    # DSPARK_TOPK_DUMP — selection-headroom capture. DEAD CODE unless the env is "1".
+    #
+    # WHY: our num_spec=7 result put every token we lose to the released draft at the
+    # positions the block never trained on. inco.ai's DFlash2 post reports a SECOND,
+    # orthogonal gap on the same symptom -- on their drafter, GSM8K position-6 recall is
+    # 72.9% at top-1 but 87.8% at top-16, i.e. the right token is usually still among the
+    # candidates and it is `argmax` that throws it away. Whether OUR draft carries that
+    # headroom is a property of our own weights, and this is the serve-side measurement
+    # of it (the training-side one is teacher-forced and therefore only an upper bound).
+    #
+    # WHAT IS AND IS NOT AVAILABLE HERE: the proposer only drafts -- it never sees the
+    # target's logits, so per-position "recall@k" cannot be computed inside this file.
+    # What it DOES see, one round later in set_inputs_first_pass(), is `next_token_ids`
+    # (the target's correction) and the rejection count. Joining round r's candidates
+    # with round r+1's rejection info yields the decision-relevant quantity:
+    #
+    #     P(target's token at the FIRST REJECTED position is in the draft's top-K there)
+    #
+    # High  -> argmax is discarding a token the draft already ranked; a selector has
+    #          something real to recover, and path selection is worth costing out.
+    # Low   -> the draft genuinely does not know that token. Nothing to select from;
+    #          the block-width retrain stays the only lever.
+    #
+    # Positions after the first rejection are NOT recoverable this way (vLLM stops at
+    # the first mismatch and never reveals the target's token there), so this measures
+    # the first miss only -- which is exactly where a selector would have to act.
+    #
+    # ENV: DSPARK_TOPK_DUMP=1  DSPARK_TOPK_K=16  DSPARK_TOPK_ROUNDS=200
+    #      DSPARK_TOPK_DIR=/tmp/dspark_topk
+    # Writes ONE .pt after DSPARK_TOPK_ROUNDS rounds, then goes permanently inert.
+    # Analyse with examples/ascend_npu_dflash/topk_headroom_join.py in speculators.
+    # ──────────────────────────────────────────────────────────────────────────────
+    def _topk_dump_on(self) -> bool:
+        state = getattr(self, "_tkd", None)
+        if state is None:
+            import os as _os
+
+            enabled = _os.environ.get("DSPARK_TOPK_DUMP") == "1"
+            state = {
+                "enabled": enabled,
+                "k": int(_os.environ.get("DSPARK_TOPK_K", "16")),
+                "rounds": int(_os.environ.get("DSPARK_TOPK_ROUNDS", "200")),
+                "dir": _os.environ.get("DSPARK_TOPK_DIR", "/tmp/dspark_topk"),
+                "cand": [],  # per round: dict(round, ids, vals, picks, seed)
+                "verify": [],  # per round: dict(round, next_token_ids, rejected)
+                "round": 0,
+                "done": False,
+            }
+            self._tkd = state
+            if enabled:
+                print(
+                    f">>> [DSPARK_TOPK_DUMP] armed: k={state['k']} rounds={state['rounds']} dir={state['dir']}",
+                    flush=True,
+                )
+        return bool(state["enabled"]) and not state["done"]
+
+    def _topk_dump_open(self, num_reqs: int) -> dict | None:
+        """Per-call scratch, or None when the dump is off (the hot path stays clean)."""
+        if not self._topk_dump_on():
+            return None
+        return {"k": self._tkd["k"], "ids": [], "vals": []}
+
+    def _topk_dump_close(self, buf: dict | None, num_reqs: int) -> None:
+        """Stack this round's candidates and stash them; flush once the budget is hit.
+
+        Everything stays on device until the flush, so the drafting loop takes no D2H
+        sync -- the one `.cpu()` happens on the final round, off the steady-state path.
+        """
+        if buf is None or not buf["ids"]:
+            return
+        state = self._tkd
+        state["cand"].append(
+            {
+                "round": state["round"],
+                "num_reqs": int(num_reqs),
+                "ids": torch.stack(buf["ids"], dim=1),  # [num_reqs, block, k]
+                "vals": torch.stack(buf["vals"], dim=1),  # [num_reqs, block, k]
+                "picks": self._draft_buffer[:num_reqs, : self.block_size].clone(),
+                "seed": self._seed_buffer[:num_reqs].clone(),
+            }
+        )
+        if len(state["cand"]) >= state["rounds"]:
+            self._topk_dump_flush()
+
+    def _topk_dump_note_verify(self, next_token_ids, rejected, batch_size: int) -> None:
+        """Round r+1's view of round r: the target's correction and how much it rejected."""
+        if not self._topk_dump_on():
+            return
+        state = self._tkd
+        state["round"] += 1
+        if next_token_ids is None:
+            return
+        state["verify"].append(
+            {
+                "round": state["round"],
+                # The block this correction actually judges was drafted one round earlier.
+                # Carried explicitly so the offline join cannot get the offset wrong --
+                # match verify["describes_round"] to cand["round"], never round to round.
+                "describes_round": state["round"] - 1,
+                "num_reqs": int(batch_size),
+                "next_token_ids": next_token_ids[:batch_size].clone(),
+                "rejected": None if rejected is None else rejected[:batch_size].clone(),
+            }
+        )
+
+    def _topk_dump_flush(self) -> None:
+        import os as _os
+
+        state = self._tkd
+        if state["done"]:
+            return
+        state["done"] = True
+        try:
+            _os.makedirs(state["dir"], exist_ok=True)
+            to_cpu = lambda d: {  # noqa: E731
+                k: (v.detach().to("cpu") if isinstance(v, torch.Tensor) else v) for k, v in d.items()
+            }
+            path = _os.path.join(state["dir"], f"topk_rank{getattr(self, 'dp_rank', 0)}.pt")
+            torch.save(
+                {
+                    "k": state["k"],
+                    "block_size": self.block_size,
+                    "cand": [to_cpu(c) for c in state["cand"]],
+                    "verify": [to_cpu(v) for v in state["verify"]],
+                },
+                path,
+            )
+            print(
+                f">>> [DSPARK_TOPK_DUMP] wrote {len(state['cand'])} rounds -> {path} (now inert)",
+                flush=True,
+            )
+        except Exception as exc:  # a probe must never take down a serve
+            print(f">>> [DSPARK_TOPK_DUMP] flush failed, continuing: {exc!r}", flush=True)
+        finally:
+            state["cand"] = []
+            state["verify"] = []
+
     def _sample_sequential(
         self,
         hidden_states: torch.Tensor,
@@ -618,8 +763,19 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
             idx_mapping = idx_mapping[:num_reqs].to(device=base_logits.device, dtype=torch.int32).contiguous()
             temperatures = self._sampling_temperature(metadata, num_reqs, base_logits.device)
             seeds = self._sampling_seeds(metadata, num_reqs, base_logits.device)
+        # ── DSPARK_TOPK_DUMP: selection-headroom capture (DEAD CODE unless =1) ──
+        # Records the top-K candidates the drafter actually had at each step, so an
+        # offline join against the NEXT round's rejection info answers: when argmax
+        # picked the wrong token, was the target's token among the candidates?
+        # See _topk_dump_record() for the contract; nothing here runs when off.
+        _tk_buf = self._topk_dump_open(num_reqs)
+
         for step in range(self.block_size):
             logits = base_logits[:, step] + self.model.markov_bias(self.model.markov_embed(prev_ids))
+            if _tk_buf is not None:
+                _tk_v, _tk_i = torch.topk(logits.float(), _tk_buf["k"], dim=-1)
+                _tk_buf["ids"].append(_tk_i)
+                _tk_buf["vals"].append(_tk_v)
             if probabilistic:
                 assert draft_logits is not None
                 assert idx_mapping is not None
@@ -640,6 +796,7 @@ class AscendDeepSeekV4DSparkProposer(AscendDsparkProposer):
                 draft_ids = _greedy_sample(logits)
             self._draft_buffer[:num_reqs, step].copy_(draft_ids)
             prev_ids = self._draft_buffer[:num_reqs, step]
+        self._topk_dump_close(_tk_buf, num_reqs)
         self._last_draft_logits = None if draft_logits is None else draft_logits.contiguous()
         return self._draft_buffer[:num_reqs]
 
