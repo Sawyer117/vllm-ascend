@@ -259,6 +259,23 @@ class NPUModelRunner(GPUModelRunner):
                 aux_hidden_states=aux_hidden_states,
             )
 
+        # Plan B: dump DSpark target hidden states (opt-in DSPARK_HS_DUMP=1).
+        # Placed AFTER the flashcomm all-gather above on purpose -- before it, each rank holds
+        # only its own shard of hidden/aux and the dump would be silently fragmented.
+        # Skipped for dummy/profile runs, whose tensors are garbage. See dspark_hs_dumper.py.
+        if (
+            self.is_last_pp_rank
+            and not dummy_run
+            and not is_profile
+            and self.execute_model_state is not None
+        ):
+            if getattr(self, "_dspark_hs_dumper", None) is None:
+                from vllm_ascend.dspark_hs_dumper import DsparkHSDumper
+
+                self._dspark_hs_dumper = DsparkHSDumper()
+            if self._dspark_hs_dumper.active:
+                self._dspark_hs_dumper.capture_from_state(self.execute_model_state)
+
         return output
 
     @torch.inference_mode()
