@@ -44,8 +44,21 @@ OUTPUT   ``<dir>/verdict_<tag>_<pid>_<n>.npz``  +  ``<dir>/reqs_<tag>_<pid>.json
     draft_tok       int32   what the draft proposed
     target_tok      int32   what the target would emit (global argmax, already all-gathered)
     accepted        bool    slot <= accepted prefix length
+    bonus_tok       int32   the step's bonus token for this request (see below)
     target_top1_p   float16 target's probability on its own argmax   (PROBS=1)
     target_p_draft  float16 target's probability on the draft's token (PROBS=1)
+
+★ WHY ``bonus_tok`` IS HERE. Two runs of the same eval get DIFFERENT request-id strings, so
+the only thing that can join them is the OUTPUT TOKEN SEQUENCE (identical at temperature 0).
+Rebuilding that sequence from the rows needs the token actually emitted at every position:
+
+    rejected at slot k -> the k accepted drafts, then ``target_tok`` at slot k
+    all slots accepted -> every draft, then the BONUS token
+
+The bonus case has no row of its own -- it is emitted past the last drafted slot -- so without
+this column the reconstruction silently drops one token exactly on the steps that went best,
+and the two runs then fail to align. Repeated per row (same value within a request-step);
+830k rows of int32 is ~3 MB, which is not worth a second array to avoid.
 """
 
 from __future__ import annotations
@@ -58,7 +71,7 @@ import torch
 
 from vllm.logger import logger
 
-_COLS_I32 = ("step", "req", "out_idx", "draft_tok", "target_tok")
+_COLS_I32 = ("step", "req", "out_idx", "draft_tok", "target_tok", "bonus_tok")
 
 
 class DsparkVerdictDumper:
@@ -119,6 +132,7 @@ class DsparkVerdictDumper:
         cu_num_draft_tokens: torch.Tensor, # [batch]
         target_argmax: torch.Tensor,       # [num_tokens]  already GLOBAL (greedy_sample)
         output_token_ids: torch.Tensor,    # [batch, max_spec_len + 1]
+        bonus_token_ids: torch.Tensor,     # [batch, 1]
         raw_target_logits: torch.Tensor | None,  # UNPROCESSED logits
         all_greedy: bool,
         logits_sharded: bool,
@@ -143,6 +157,7 @@ class DsparkVerdictDumper:
         # from /metrics keeps the row-level and aggregate views from ever disagreeing.
         out = output_token_ids.tolist()
         n_emit = [sum(1 for t in row if t >= 0) for row in out]
+        bonus = [int(x[0]) for x in bonus_token_ids.tolist()]
 
         probs_top1 = probs_draft = None
         if self.want_probs and raw_target_logits is not None:
@@ -166,7 +181,8 @@ class DsparkVerdictDumper:
             for slot, i in enumerate(range(prev, end)):
                 self._push(
                     step=step, req=ridx, out_idx=base + slot, slot=slot,
-                    draft_tok=draft[i], target_tok=targ[i], accepted=slot < n_acc,
+                    draft_tok=draft[i], target_tok=targ[i], bonus_tok=bonus[b],
+                    accepted=slot < n_acc,
                     top1=probs_top1[i] if probs_top1 else 0.0,
                     pdraft=probs_draft[i] if probs_draft else 0.0,
                 )
@@ -176,13 +192,15 @@ class DsparkVerdictDumper:
         if self._rows and len(self._rows["step"]) >= self.flush_rows:
             self.flush()
 
-    def _push(self, *, step, req, out_idx, slot, draft_tok, target_tok, accepted, top1, pdraft):
+    def _push(self, *, step, req, out_idx, slot, draft_tok, target_tok, bonus_tok,
+              accepted, top1, pdraft):
         r = self._rows
         if not r:
             for c in (*_COLS_I32, "slot", "accepted", "target_top1_p", "target_p_draft"):
                 r[c] = []
         r["step"].append(step); r["req"].append(req); r["out_idx"].append(out_idx)
         r["slot"].append(slot); r["draft_tok"].append(draft_tok); r["target_tok"].append(target_tok)
+        r["bonus_tok"].append(bonus_tok)
         r["accepted"].append(accepted)
         r["target_top1_p"].append(top1); r["target_p_draft"].append(pdraft)
 

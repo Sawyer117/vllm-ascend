@@ -628,6 +628,7 @@ def rejection_sample(
                     cu_num_draft_tokens=cu_num_draft_tokens,
                     target_argmax=target_argmax,
                     output_token_ids=output_token_ids,
+                    bonus_token_ids=bonus_token_ids,
                     raw_target_logits=ori_target_logits,
                     all_greedy=True,
                     logits_sharded=bool(get_ascend_config().enable_reduce_sample),
