@@ -1,0 +1,296 @@
+"""Per-slot accept/reject dumper for DSpark speculative decoding (failure-mode analysis).
+
+WHAT IT RECORDS AND WHY. The serve already exposes aggregate per-position accept rates via
+``/metrics``, which answers "how often does slot k survive" but not "on WHICH tokens, and was
+the target even sure". This dumper writes one row per DRAFTED SLOT so both questions become
+joinable against the generated text.
+
+★ THE WHOLE BLOCK, NOT JUST THE FIRST MISMATCH. Verification runs the target over every draft
+slot in ONE forward, so ``target_argmax`` for the slots AFTER the rejection point is already
+computed and sitting in memory. Logging only the rejection index throws away 14 of 15 columns
+that cost nothing. Keeping them answers the counterfactual the aggregate metrics cannot:
+*would the draft have recovered on its own two slots later?*
+
+★ ``target_top1_p`` IS THE LOAD-BEARING COLUMN. Without it, "rejected" conflates two opposite
+findings:
+  * target is confident (p>0.9) and the draft still missed  -> the DRAFT is weak. Fixable, and
+    it is exactly what more/better training buys.
+  * target itself is unsure (p<0.5)                         -> nobody predicts that position.
+    Not a draft failure; spending training on it is spending on noise.
+Those two demand opposite next moves, so a dump without this column cannot drive a decision.
+
+★ ALIGNMENT IS BY ``out_idx``, NOT BY STEP. Two drafts with different block sizes (released is
+block-5 at ns=5, ours is block-15 at ns=15) never share step boundaries, and their accept
+lengths differ anyway. But at temperature 0 both produce the SAME output token sequence, so the
+running index of emitted tokens per request is a valid join key across runs. That is what
+``out_idx`` is, and it is the only reason the two dumps can be compared at all.
+
+SCOPE. Greedy only (``sampling_metadata.all_greedy``). Under sampling there is no single
+"target token" to compare against and the accept rule is stochastic; the dumper no-ops with one
+warning rather than writing numbers that look comparable and are not. Our evals are temp=0.
+
+ENV
+    DSPARK_VERDICT_DUMP=1          enable
+    DSPARK_VERDICT_DIR=<dir>       output directory (required when enabled)
+    DSPARK_VERDICT_PROBS=0         drop the two probability columns (skips 3 small all-reduces)
+    DSPARK_VERDICT_TAG=<str>       goes into the filenames; use it to tell the two drafts apart
+    DSPARK_VERDICT_FLUSH=200000    rows per output shard
+
+OUTPUT   ``<dir>/verdict_<tag>_<pid>_<n>.npz``  +  ``<dir>/reqs_<tag>_<pid>.json``
+    step            int32   global forward counter (this process)
+    req             int32   index into the reqs_*.json list of request-id strings
+    out_idx         int32   ★ index of this slot's token in the request's OUTPUT stream
+    slot            int8    position inside the draft block (0 = first drafted token)
+    draft_tok       int32   what the draft proposed
+    target_tok      int32   what the target would emit (global argmax, already all-gathered)
+    accepted        bool    slot <= accepted prefix length
+    bonus_tok       int32   the step's bonus token for this request (see below)
+    target_top1_p   float16 target's probability on its own argmax   (PROBS=1)
+    target_p_draft  float16 target's probability on the draft's token (PROBS=1)
+
+★ WHY ``bonus_tok`` IS HERE. Two runs of the same eval get DIFFERENT request-id strings, so
+the only thing that can join them is the OUTPUT TOKEN SEQUENCE (identical at temperature 0).
+Rebuilding that sequence from the rows needs the token actually emitted at every position:
+
+    rejected at slot k -> the k accepted drafts, then ``target_tok`` at slot k
+    all slots accepted -> every draft, then the BONUS token
+
+The bonus case has no row of its own -- it is emitted past the last drafted slot -- so without
+this column the reconstruction silently drops one token exactly on the steps that went best,
+and the two runs then fail to align. Repeated per row (same value within a request-step);
+830k rows of int32 is ~3 MB, which is not worth a second array to avoid.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+
+import numpy as np
+import torch
+
+from vllm.logger import logger
+
+_COLS_I32 = ("step", "req", "out_idx", "draft_tok", "target_tok", "bonus_tok")
+
+
+class DsparkVerdictDumper:
+    def __init__(self) -> None:
+        self.enabled = os.environ.get("DSPARK_VERDICT_DUMP", "0") == "1"
+        self.out_dir = os.environ.get("DSPARK_VERDICT_DIR", "")
+        self.want_probs = os.environ.get("DSPARK_VERDICT_PROBS", "1") == "1"
+        self.tag = os.environ.get("DSPARK_VERDICT_TAG", "run")
+        self.flush_rows = int(os.environ.get("DSPARK_VERDICT_FLUSH", "200000"))
+
+        self._step = 0
+        self._shard = 0
+        self._rows: dict[str, list] = {}
+        self._req_ids: list[str] = []          # index -> request id string
+        self._req_index: dict[str, int] = {}
+        self._out_pos: dict[str, int] = {}     # request id -> next output index
+        self._batch_req_ids: list[str] | None = None
+        self._warned_nongreedy = False
+        self._is_writer = False
+
+        if not self.enabled:
+            return
+        try:
+            from vllm.distributed import get_tensor_model_parallel_rank
+
+            self._is_writer = get_tensor_model_parallel_rank() == 0
+        except Exception:  # pragma: no cover - single rank / not initialised yet
+            self._is_writer = True
+        if not self.out_dir:
+            raise ValueError("DSPARK_VERDICT_DUMP=1 requires DSPARK_VERDICT_DIR")
+        if self._is_writer:
+            os.makedirs(self.out_dir, exist_ok=True)
+            logger.info(
+                "DsparkVerdictDumper active: tag=%s probs=%s -> %s",
+                self.tag, self.want_probs, self.out_dir,
+            )
+
+    @property
+    def active(self) -> bool:
+        return self.enabled and self._is_writer
+
+    def set_batch_req_ids(self, req_ids) -> None:
+        """Called by the model runner once per forward, before sampling.
+
+        The rejection sampler does not receive request ids, and batch SLOTS are recycled
+        across requests, so without this the per-request output stream cannot be rebuilt --
+        rows would be unjoinable to anything. Cheap enough to call unconditionally.
+        """
+        if self.enabled:
+            self._batch_req_ids = list(req_ids) if req_ids is not None else None
+
+    # ------------------------------------------------------------------ capture
+
+    @torch.inference_mode()
+    def capture(
+        self,
+        draft_token_ids: torch.Tensor,     # [num_tokens]
+        cu_num_draft_tokens: torch.Tensor, # [batch]
+        target_argmax: torch.Tensor,       # [num_tokens]  already GLOBAL (greedy_sample)
+        output_token_ids: torch.Tensor,    # [batch, max_spec_len + 1]
+        bonus_token_ids: torch.Tensor,     # [batch, 1]
+        raw_target_logits: torch.Tensor | None,  # UNPROCESSED logits
+        all_greedy: bool,
+        logits_sharded: bool,
+    ) -> None:
+        if not self.active:
+            return
+        if not all_greedy:
+            if not self._warned_nongreedy:
+                self._warned_nongreedy = True
+                logger.warning("DsparkVerdictDumper: sampling is not all-greedy; not dumping.")
+            return
+
+        step = self._step
+        self._step += 1
+
+        cu = cu_num_draft_tokens.tolist()
+        draft = draft_token_ids.tolist()
+        targ = target_argmax.tolist()
+        # Accepted prefix length per request. output_token_ids pads rejected slots with -1,
+        # so counting non-negative entries and subtracting the always-present bonus token
+        # gives the number of ACCEPTED DRAFT tokens. Deriving it here rather than taking it
+        # from /metrics keeps the row-level and aggregate views from ever disagreeing.
+        out = output_token_ids.tolist()
+        n_emit = [sum(1 for t in row if t >= 0) for row in out]
+        bonus = [int(x[0]) for x in bonus_token_ids.tolist()]
+
+        probs_top1 = probs_draft = None
+        if self.want_probs and raw_target_logits is not None:
+            probs_top1, probs_draft = self._global_probs(
+                raw_target_logits, draft_token_ids, logits_sharded
+            )
+            probs_top1 = probs_top1.tolist()
+            probs_draft = probs_draft.tolist()
+
+        prev = 0
+        for b, end in enumerate(cu):
+            rid = self._batch_req_ids[b] if self._batch_req_ids and b < len(self._batch_req_ids) \
+                else f"?slot{b}"
+            ridx = self._req_index.get(rid)
+            if ridx is None:
+                ridx = len(self._req_ids)
+                self._req_index[rid] = ridx
+                self._req_ids.append(rid)
+            base = self._out_pos.get(rid, 0)
+            n_acc = max(0, n_emit[b] - 1)          # emitted = accepted drafts + 1 bonus
+            for slot, i in enumerate(range(prev, end)):
+                self._push(
+                    step=step, req=ridx, out_idx=base + slot, slot=slot,
+                    draft_tok=draft[i], target_tok=targ[i], bonus_tok=bonus[b],
+                    accepted=slot < n_acc,
+                    top1=probs_top1[i] if probs_top1 else 0.0,
+                    pdraft=probs_draft[i] if probs_draft else 0.0,
+                )
+            self._out_pos[rid] = base + n_emit[b]
+            prev = end
+
+        if self._rows and len(self._rows["step"]) >= self.flush_rows:
+            self.flush()
+
+    def _push(self, *, step, req, out_idx, slot, draft_tok, target_tok, bonus_tok,
+              accepted, top1, pdraft):
+        r = self._rows
+        if not r:
+            for c in (*_COLS_I32, "slot", "accepted", "target_top1_p", "target_p_draft"):
+                r[c] = []
+        r["step"].append(step); r["req"].append(req); r["out_idx"].append(out_idx)
+        r["slot"].append(slot); r["draft_tok"].append(draft_tok); r["target_tok"].append(target_tok)
+        r["bonus_tok"].append(bonus_tok)
+        r["accepted"].append(accepted)
+        r["target_top1_p"].append(top1); r["target_p_draft"].append(pdraft)
+
+    # ------------------------------------------------------------------ probabilities
+
+    @staticmethod
+    def _global_probs(logits: torch.Tensor, draft_token_ids: torch.Tensor, sharded: bool):
+        """Target probability on its own argmax, and on the draft's token — GLOBAL under TP.
+
+        ⚠️ ``sharded`` is PASSED IN, never guessed. ``rejection_sample`` has two greedy
+        branches -- ``enable_reduce_sample`` gathers (so its input IS vocab-sharded), the other
+        takes a plain ``argmax`` (so its input is already full-vocab). Inferring which one ran
+        from the tensor shape would need the vocab size, which this module has no business
+        knowing; getting it wrong silently produces per-rank "probabilities" that are not
+        probabilities. The caller knows, so the caller says.
+
+        ⚠️ When sharded, a local softmax has the wrong denominator, so a
+        per-rank probability is not a probability at all. The global log-sum-exp needs two
+        all-reduces (max, then the shifted sum) and the draft token's logit needs a third
+        because it lives on whichever rank owns its slice. Three [num_tokens] all-reduces per
+        forward — negligible bytes, but three extra sync points, which is why PROBS=0 exists.
+
+        The shard layout (``global_id = rank * V_local + local_id``) is not assumed: it is the
+        same arithmetic ``greedy_sample`` uses to rebuild global ids, so the two agree by
+        construction.
+        """
+        tp, world = None, 1
+        if sharded:
+            try:
+                from vllm.distributed import get_tp_group
+
+                tp = get_tp_group()
+                world = tp.world_size
+            except Exception:  # pragma: no cover
+                world = 1
+
+        lg = logits.float()
+        if world == 1:
+            lse = lg.logsumexp(dim=-1)
+            top1 = (lg.max(dim=-1).values - lse).exp()
+            pdr = (lg.gather(1, draft_token_ids.view(-1, 1).long()).squeeze(1) - lse).exp()
+            return top1.half().cpu(), pdr.half().cpu()
+
+        import torch.distributed as dist
+
+        grp = tp.device_group
+        v_local, rank = lg.shape[1], tp.rank_in_group
+
+        gmax = lg.max(dim=-1).values.contiguous()
+        dist.all_reduce(gmax, op=dist.ReduceOp.MAX, group=grp)
+        sumexp = (lg - gmax.unsqueeze(1)).exp().sum(dim=-1).contiguous()
+        dist.all_reduce(sumexp, op=dist.ReduceOp.SUM, group=grp)
+        lse = gmax + sumexp.log()
+
+        d = draft_token_ids.long()
+        owner = (d // v_local) == rank
+        local_idx = (d % v_local).clamp_(0, v_local - 1).view(-1, 1)
+        dlogit = lg.gather(1, local_idx).squeeze(1)
+        dlogit = torch.where(owner, dlogit, torch.full_like(dlogit, float("-inf"))).contiguous()
+        dist.all_reduce(dlogit, op=dist.ReduceOp.MAX, group=grp)
+
+        return (gmax - lse).exp().half().cpu(), (dlogit - lse).exp().half().cpu()
+
+    # ------------------------------------------------------------------ output
+
+    def flush(self) -> None:
+        if not self.active or not self._rows or not self._rows["step"]:
+            return
+        path = os.path.join(self.out_dir, f"verdict_{self.tag}_{os.getpid()}_{self._shard}.npz")
+        np.savez_compressed(
+            path,
+            **{c: np.asarray(self._rows[c], dtype=np.int32) for c in _COLS_I32},
+            slot=np.asarray(self._rows["slot"], dtype=np.int8),
+            accepted=np.asarray(self._rows["accepted"], dtype=bool),
+            target_top1_p=np.asarray(self._rows["target_top1_p"], dtype=np.float16),
+            target_p_draft=np.asarray(self._rows["target_p_draft"], dtype=np.float16),
+        )
+        n = len(self._rows["step"])
+        self._rows = {}
+        self._shard += 1
+        with open(os.path.join(self.out_dir, f"reqs_{self.tag}_{os.getpid()}.json"), "w") as fh:
+            json.dump(self._req_ids, fh)
+        logger.info("DsparkVerdictDumper wrote %d rows -> %s", n, path)
+
+
+_DUMPER: DsparkVerdictDumper | None = None
+
+
+def get_verdict_dumper() -> DsparkVerdictDumper:
+    global _DUMPER
+    if _DUMPER is None:
+        _DUMPER = DsparkVerdictDumper()
+    return _DUMPER

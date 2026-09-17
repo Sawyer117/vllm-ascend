@@ -22,6 +22,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.dspark_verdict_dumper import get_verdict_dumper
 from vllm_ascend.ops.triton.reject_sample import (
     cal_grid_and_block_size,
     expand_triton,
@@ -613,6 +614,25 @@ def rejection_sample(
                     synthetic_mode=synthetic_mode,
                 )
         if sampling_metadata.all_greedy:
+            # Failure-mode dump (DSPARK_VERDICT_DUMP=1; no-op otherwise). Hooked HERE and not
+            # at the caller because `target_argmax` only exists in this scope -- reproducing it
+            # outside would mean repeating the TP all-gather that `greedy_sample` just did.
+            # `ori_target_logits` rather than `target_logits`: the latter has been through the
+            # logits processors and sampling constraints, so its probabilities describe the
+            # SAMPLER's view, not the model's, and "was the target actually unsure here" is a
+            # question about the model.
+            _vd = get_verdict_dumper()
+            if _vd.active:
+                _vd.capture(
+                    draft_token_ids=draft_token_ids,
+                    cu_num_draft_tokens=cu_num_draft_tokens,
+                    target_argmax=target_argmax,
+                    output_token_ids=output_token_ids,
+                    bonus_token_ids=bonus_token_ids,
+                    raw_target_logits=ori_target_logits,
+                    all_greedy=True,
+                    logits_sharded=bool(get_ascend_config().enable_reduce_sample),
+                )
             return output_token_ids
 
     # For random sampling with selected logits
