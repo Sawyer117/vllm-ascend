@@ -296,6 +296,15 @@ class NPUModelRunner(GPUModelRunner):
 
         req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
 
+        # The rejection sampler gets no request ids, and batch SLOTS are recycled between
+        # requests -- so without handing them over here, a per-slot accept/reject dump cannot
+        # be attributed to a request and is unjoinable to anything. `sort_batch_req_ids` has
+        # already put them in the batch's own order, which is exactly the order the sampler's
+        # `cu_num_draft_tokens` slices. No-op unless DSPARK_VERDICT_DUMP=1.
+        from vllm_ascend.dspark_verdict_dumper import get_verdict_dumper  # noqa: PLC0415
+
+        get_verdict_dumper().set_batch_req_ids(req_ids)
+
         self._update_seq_lens_cpu(scheduler_output, req_ids)
 
         numtoks_iter = map(num_tokens_per_req.get, req_ids)
