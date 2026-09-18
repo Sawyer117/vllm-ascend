@@ -34,7 +34,10 @@ ENV
     DSPARK_VERDICT_DIR=<dir>       output directory (required when enabled)
     DSPARK_VERDICT_PROBS=0         drop the two probability columns (skips 3 small all-reduces)
     DSPARK_VERDICT_TAG=<str>       goes into the filenames; use it to tell the two drafts apart
-    DSPARK_VERDICT_FLUSH=200000    rows per output shard
+    DSPARK_VERDICT_FLUSH=20000     rows per output shard。⚠ 这个值必须远小于一次评测里
+                                   【每个 writer】产生的行数,否则整轮跑完不落盘且不报错
+                                   (踩过:gsm8k 全集 ns=5 = 219,640 行 ÷ DP2 ≈ 110k < 200000)。
+                                   另有 atexit 兜底,但 SIGKILL 下不执行 —— 别只靠它。
 
 OUTPUT   ``<dir>/verdict_<tag>_<pid>_<n>.npz``  +  ``<dir>/reqs_<tag>_<pid>.json``
     step            int32   global forward counter (this process)
@@ -63,6 +66,7 @@ and the two runs then fail to align. Repeated per row (same value within a reque
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 
@@ -80,7 +84,11 @@ class DsparkVerdictDumper:
         self.out_dir = os.environ.get("DSPARK_VERDICT_DIR", "")
         self.want_probs = os.environ.get("DSPARK_VERDICT_PROBS", "1") == "1"
         self.tag = os.environ.get("DSPARK_VERDICT_TAG", "run")
-        self.flush_rows = int(os.environ.get("DSPARK_VERDICT_FLUSH", "200000"))
+        # ⚠ 默认值从 200000 降到 20000。实测教训:gsm8k 全集 released@ns=5 只产生
+        # num_draft_tokens=219,640 行,而 DP2 下两个 writer 各写一半 ≈110k —— 【都没到
+        # 200000】,于是整轮跑完一个字节都没落盘,行全堆在 worker 内存里,没有任何报错。
+        # 阈值必须远小于「一次正常评测的每-writer 行数」,否则它就是个静默丢数据的陷阱。
+        self.flush_rows = int(os.environ.get("DSPARK_VERDICT_FLUSH", "20000"))
 
         self._step = 0
         self._shard = 0
@@ -104,9 +112,12 @@ class DsparkVerdictDumper:
             raise ValueError("DSPARK_VERDICT_DUMP=1 requires DSPARK_VERDICT_DIR")
         if self._is_writer:
             os.makedirs(self.out_dir, exist_ok=True)
+            # ⚠ 兜底:阈值是「够大的 run 才会触发」,atexit 是「多小的 run 都落得下来」。
+            # 两个都要 —— 只靠 atexit,SIGKILL 下不执行;只靠阈值,小数据集全丢。
+            atexit.register(self._flush_at_exit)
             logger.info(
-                "DsparkVerdictDumper active: tag=%s probs=%s -> %s",
-                self.tag, self.want_probs, self.out_dir,
+                "DsparkVerdictDumper active: tag=%s probs=%s flush_every=%d -> %s",
+                self.tag, self.want_probs, self.flush_rows, self.out_dir,
             )
 
     @property
@@ -265,6 +276,15 @@ class DsparkVerdictDumper:
         return (gmax - lse).exp().half().cpu(), (dlogit - lse).exp().half().cpu()
 
     # ------------------------------------------------------------------ output
+
+    def _flush_at_exit(self) -> None:
+        """atexit 回调。解释器关停时 numpy/logging 可能已被拆掉,所以整段吞异常 ——
+        退出路径上抛异常只会淹没真正的退出原因,而这里最坏的结果是丢掉最后一个分片。"""
+        try:
+            if self._rows and self._rows.get("step"):
+                self.flush()
+        except Exception:  # noqa: BLE001 — 退出路径,不能抛
+            pass
 
     def flush(self) -> None:
         if not self.active or not self._rows or not self._rows["step"]:
