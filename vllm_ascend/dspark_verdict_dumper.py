@@ -285,6 +285,12 @@ class DsparkVerdictDumper:
             stacked = torch.stack(iters, dim=1)          # [B, n_iter, K]  <- slot-major 转 req-major
             flat = stacked.reshape(-1, stacked.shape[-1])
             want = draft_token_ids.detach().to("cpu", torch.int32).reshape(-1)
+            # ⚠ proposer 按【padding 后】的批草稿(DP 对齐的哑请求等),而 cu_num_draft_tokens
+            # 只覆盖真实请求 —— 实测 25 vs 20,正好多一个 block。padding 在尾部,截掉即可。
+            # ★ 截断的正确性不靠「padding 一定在尾部」这个假设,靠下面那条【逐行】校验兜底:
+            # 首列必须等于 draft_token_ids,padding 若不在尾部,截完必然对不上。
+            if flat.shape[0] > want.numel():
+                flat = flat[: want.numel()]
             if flat.shape[0] != want.numel() or not torch.equal(flat[:, 0], want):
                 bad = int((flat[:, 0] != want).sum()) if flat.shape[0] == want.numel() else -1
                 self._topk_dead = True
