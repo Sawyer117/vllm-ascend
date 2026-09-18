@@ -69,6 +69,7 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import signal
 
 import numpy as np
 import torch
@@ -116,6 +117,7 @@ class DsparkVerdictDumper:
             # ⚠ 兜底:阈值是「够大的 run 才会触发」,atexit 是「多小的 run 都落得下来」。
             # 两个都要 —— 只靠 atexit,SIGKILL 下不执行;只靠阈值,小数据集全丢。
             atexit.register(self._flush_at_exit)
+            self._install_sigterm_flush()
             logger.info(
                 "DsparkVerdictDumper active: tag=%s probs=%s flush_every=%d -> %s",
                 self.tag, self.want_probs, self.flush_rows, self.out_dir,
@@ -290,6 +292,40 @@ class DsparkVerdictDumper:
         return (gmax - lse).exp().half().cpu(), (dlogit - lse).exp().half().cpu()
 
     # ------------------------------------------------------------------ output
+
+    def _install_sigterm_flush(self) -> None:
+        """在 SIGTERM 上刷盘,然后把信号交回原处理器。
+
+        ⚠ 为什么 atexit 不够(实测):vLLM 的执行器关停时对 worker 先发 SIGTERM、等一个宽限期
+        再发 SIGKILL —— 日志里那句 `[shutdown] Executor: workers still running after SIGTERM;
+        sending SIGKILL`。而 Python 对 SIGTERM 的默认处置是直接终止,【不跑 atexit】;SIGKILL
+        更不可能。结果就是:跑完一轮,每个 writer 最后那不到 flush_rows 行的残余全部丢失
+        (实测丢了 21,280 行 / 9.6%,而且丢的是尾部请求,跨 run join 会错位)。
+        SIGTERM 与 SIGKILL 之间的那个宽限期,是唯一能落盘的窗口。
+        """
+        try:
+            prev = signal.getsignal(signal.SIGTERM)
+        except Exception:  # noqa: BLE001
+            return
+
+        def _handler(signum, frame):
+            try:
+                if self._rows and self._rows.get("step"):
+                    self.flush()
+            except Exception:  # noqa: BLE001 — 关停路径,不能抛
+                pass
+            # 交回原行为,别改变 vLLM 自己的关停语义
+            if callable(prev):
+                prev(signum, frame)
+            else:
+                signal.signal(signal.SIGTERM, signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+
+        try:
+            signal.signal(signal.SIGTERM, _handler)
+        except ValueError:
+            # 只有主线程能装信号处理器;装不上就退回 atexit + 阈值
+            logger.warning("DsparkVerdictDumper: 非主线程,SIGTERM 刷盘未装,尾部可能丢失")
 
     def _flush_at_exit(self) -> None:
         """atexit 回调。解释器关停时 numpy/logging 可能已被拆掉,所以整段吞异常 ——
