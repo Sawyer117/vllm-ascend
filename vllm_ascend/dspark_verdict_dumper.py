@@ -121,6 +121,7 @@ class DsparkVerdictDumper:
         self._batch_req_ids: list[str] | None = None
         self._warned_nongreedy = False
         self._warned_no_req_ids = False
+        self._warned_topk_skip = False
         self._is_writer = False
 
         if not self.enabled:
@@ -148,6 +149,17 @@ class DsparkVerdictDumper:
     @property
     def active(self) -> bool:
         return self.enabled and self._is_writer
+
+    def begin_draft_pass(self) -> None:
+        """一趟草稿开始。★ 必须有这个显式起点。
+
+        proposer 在 profiling / dummy 跑里【也会】草稿,而那些跑不走 capture(),累积的
+        top-k 没人消费。没有这个清零,第一次真 capture 看到的是好几趟混在一起的残留 ——
+        实测报错 `stack expects each tensor to be equal size, got [64,64] at entry 0 and
+        [62,64] at entry 10`(num_spec=5 却攒到 entry 10,且 64/62 是 dummy 的批大小)。
+        """
+        if self.topk > 0:
+            self._topk_iters = []
 
     def push_draft_topk(self, topk: "torch.Tensor") -> None:
         """proposer 每草一位调一次,传 [B, K] 的全局 top-k id。
@@ -285,8 +297,12 @@ class DsparkVerdictDumper:
                 return
             flat.numpy().astype(np.int32).tofile(self._fh_topk)
         except Exception as e:  # noqa: BLE001
-            self._topk_dead = True
-            logger.error("DsparkVerdictDumper: top-k 落盘失败,已停止;主流不受影响:%r", e)
+            # ⚠ 不置 _topk_dead:形状不齐之类是【这一步】的问题(比如混进了 dummy 跑的残留),
+            # 跳过这步即可。只有「首列与 draft_token_ids 不符」才是系统性错位,那个才永久停。
+            # 之前一律永久停,结果一次 dummy 残留就让整轮 top-k 全废。
+            if not self._warned_topk_skip:
+                self._warned_topk_skip = True
+                logger.warning("DsparkVerdictDumper: 某步 top-k 落盘失败,已跳过该步(只报一次):%r", e)
 
     def _push(self, *, step, req, out_idx, slot, draft_tok, target_tok, bonus_tok,
               accepted, top1, pdraft):

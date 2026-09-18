@@ -1182,6 +1182,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
                     _vd = get_verdict_dumper()
                     _vd_k = _vd.topk
+                    _vd.begin_draft_pass()   # 清掉上一趟(可能是 dummy 跑)的残留
                     for idx in range(self.num_speculative_tokens):
                         markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
                         logits_bias = self.model.markov_bias(markov_emb)
