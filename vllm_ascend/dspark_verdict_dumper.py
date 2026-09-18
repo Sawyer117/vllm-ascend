@@ -31,12 +31,19 @@ warning rather than writing numbers that look comparable and are not. Our evals 
 
 ENV
     DSPARK_VERDICT_DUMP=1          enable
+    DSPARK_VERDICT_TOPK=64         另外记草稿的全局 top-k token id(0=关,默认关)。
+                                   回答:目标要的那个词排在草稿的第几位?rank 2-5 = 草稿知道
+                                   但排错序(蒸馏/损失问题);top-k 之外 = 草稿不知道(容量
+                                   问题)。⚠ 单路径 dump 只能算【首个断点处】的覆盖率,推不出
+                                   accept_len —— oracle 改了 slot s 的词,后面几位是基于草稿
+                                   自己那个错词草出来的,得重草。
     DSPARK_VERDICT_DIR=<dir>       output directory (required when enabled)
     DSPARK_VERDICT_PROBS=0         drop the two probability columns (skips 3 small all-reduces)
     DSPARK_VERDICT_TAG=<str>       goes into the filenames; use it to tell the two drafts apart
 
 OUTPUT   ``<dir>/verdict_<tag>_<pid>.bin``(定长记录,流式追加,每个投机步一次 write)
          ``<dir>/reqs_<tag>_<pid>.txt``(一行一个请求 id,行号 = ``req`` 列的取值)
+         ``<dir>/topk<K>_<tag>_<pid>.bin``(K×int32/行,行序与主流严格对应;仅 TOPK>0 时)
     ★ 不缓冲、不分片。缓冲省的是压缩开销,换来的是「阈值没到整轮不落盘」「SIGKILL
       丢尾巴」两类静默数据丢失 —— 都实际发生过。采集跑不在乎这点速度。
     step            int32   global forward counter (this process)
@@ -99,6 +106,12 @@ class DsparkVerdictDumper:
         # 阈值必须远小于「一次正常评测的每-writer 行数」,否则它就是个静默丢数据的陷阱。
 
         self._step = 0
+        # ★ top-k 侧流。放【单独的文件】而不是加宽主记录:主格式保持不变(旧分析照跑),
+        # top-k 可选、K 可变,而且文件名里带 K 所以自描述。行序与主流严格一一对应。
+        self.topk = int(os.environ.get("DSPARK_VERDICT_TOPK", "0"))
+        self._topk_iters: list = []      # 本步各次草稿迭代的 [B, K],capture 时拼装
+        self._topk_dead = False          # 对齐校验失败后置位,只停 top-k,不影响主流
+        self._fh_topk = None
         self._buf: list[tuple] = []      # 仅在一次 capture 内累积,出函数即落盘
         self._fh = None                  # 行文件(append,二进制)
         self._fh_req = None              # 请求 id 文件(append,一行一个)
@@ -125,14 +138,27 @@ class DsparkVerdictDumper:
             base = os.path.join(self.out_dir, f"{{}}_{self.tag}_{os.getpid()}")
             self._fh = open(base.format("verdict") + ".bin", "ab", buffering=0)
             self._fh_req = open(base.format("reqs") + ".txt", "a", buffering=1)
+            if self.topk > 0:
+                self._fh_topk = open(base.format(f"topk{self.topk}") + ".bin", "ab", buffering=0)
             logger.info(
-                "DsparkVerdictDumper active: tag=%s probs=%s streaming -> %s",
-                self.tag, self.want_probs, self._fh.name,
+                "DsparkVerdictDumper active: tag=%s probs=%s topk=%d streaming -> %s",
+                self.tag, self.want_probs, self.topk, self._fh.name,
             )
 
     @property
     def active(self) -> bool:
         return self.enabled and self._is_writer
+
+    def push_draft_topk(self, topk: "torch.Tensor") -> None:
+        """proposer 每草一位调一次,传 [B, K] 的全局 top-k id。
+
+        ⚠ 这里【只累积不落盘】:proposer 的输出是 slot-major(先给所有请求的 slot0,再 slot1
+        …),而拒绝采样器要的是 req-major(req0 的 slot0..K-1,再 req1…)。顺序不同,必须等
+        一整块草完、在 capture() 里转置。转错了就是一份行数对得上、内容全错的数据 —— 所以
+        capture() 里有逐行自检,见那里。
+        """
+        if self.topk > 0 and not self._topk_dead:
+            self._topk_iters.append(topk.detach().to("cpu", torch.int32))
 
     def set_batch_req_ids(self, req_ids) -> None:
         """Called by the model runner once per forward, before sampling.
@@ -229,6 +255,38 @@ class DsparkVerdictDumper:
         if self._buf:
             np.asarray(self._buf, dtype=_REC).tofile(self._fh)
             self._buf = []
+        self._write_topk(draft_token_ids)
+
+    def _write_topk(self, draft_token_ids) -> None:
+        """把本步累积的 top-k 转成 req-major 并落盘,附逐行对齐自检。
+
+        ★ 自检就是整件事的关键。proposer 给的是 slot-major [K 次迭代][B 个请求],采样器要的是
+        req-major [B][K];转置错了会得到一份【行数完全正确、内容全错】的数据 —— 今天这类
+        "看着完整的废数据" 已经坑过两次(?slot 回退、阈值不落盘)。而 top-k 的第 0 列必须
+        逐行等于 draft_token_ids(草稿选的就是它自己的第 1 名),这是一条不花钱、且转置一旦
+        错位就必然触发的全覆盖校验。不通过就【只停 top-k】、保住主流,并且只吵一次。
+        """
+        iters, self._topk_iters = self._topk_iters, []
+        if self.topk <= 0 or self._topk_dead or self._fh_topk is None or not iters:
+            return
+        try:
+            stacked = torch.stack(iters, dim=1)          # [B, n_iter, K]  <- slot-major 转 req-major
+            flat = stacked.reshape(-1, stacked.shape[-1])
+            want = draft_token_ids.detach().to("cpu", torch.int32).reshape(-1)
+            if flat.shape[0] != want.numel() or not torch.equal(flat[:, 0], want):
+                bad = int((flat[:, 0] != want).sum()) if flat.shape[0] == want.numel() else -1
+                self._topk_dead = True
+                logger.error(
+                    "DsparkVerdictDumper: top-k 与 draft_token_ids 对不齐(行数 %d vs %d,"
+                    "首列不符 %s 行)—— 已停止写 top-k,主流不受影响。proposer 的输出顺序"
+                    "与 cu_num_draft_tokens 的切片顺序不一致,转置逻辑要改。",
+                    flat.shape[0], want.numel(), bad,
+                )
+                return
+            flat.numpy().astype(np.int32).tofile(self._fh_topk)
+        except Exception as e:  # noqa: BLE001
+            self._topk_dead = True
+            logger.error("DsparkVerdictDumper: top-k 落盘失败,已停止;主流不受影响:%r", e)
 
     def _push(self, *, step, req, out_idx, slot, draft_tok, target_tok, bonus_tok,
               accepted, top1, pdraft):
