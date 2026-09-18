@@ -31,7 +31,8 @@ warning rather than writing numbers that look comparable and are not. Our evals 
 
 ENV
     DSPARK_VERDICT_DUMP=1          enable
-    DSPARK_VERDICT_TOPK=64         另外记草稿的全局 top-k token id(0=关,默认关)。
+    DSPARK_VERDICT_TOPK=64         ⚠⚠ 【目前不可用,默认关,别开】。另外记草稿的全局 top-k
+                                   token id。
                                    回答:目标要的那个词排在草稿的第几位?rank 2-5 = 草稿知道
                                    但排错序(蒸馏/损失问题);top-k 之外 = 草稿不知道(容量
                                    问题)。⚠ 单路径 dump 只能算【首个断点处】的覆盖率,推不出
@@ -44,6 +45,18 @@ ENV
 OUTPUT   ``<dir>/verdict_<tag>_<pid>.bin``(定长记录,流式追加,每个投机步一次 write)
          ``<dir>/reqs_<tag>_<pid>.txt``(一行一个请求 id,行号 = ``req`` 列的取值)
          ``<dir>/topk<K>_<tag>_<pid>.bin``(K×int32/行,行序与主流严格对应;仅 TOPK>0 时)
+
+★★ TOPK 的已知阻塞(2026-09-18,实测五轮,别再从转置查起)
+    最后停在:`行数 20 vs 20,首列不符 5 行` —— 行数对得上,但 20 行里正好一整个 block
+    (5 行)错位。这【不是】转置问题。
+    真因:proposer 草稿的那批请求,与采样器验证的那批,集合/顺序不一致。中间隔着调度器 ——
+    proposer 出完草稿后,调度器可能丢掉或重排请求,而采样器的 draft_token_ids 是从
+    scheduler_output.scheduled_spec_decode_tokens 按 input_batch 顺序【重建】的。
+    ⟹ 按位置对齐这条路走不通,无论怎么转置。正确修法是【按 req_id 交接】:proposer push
+       时带上本批的请求 id,capture() 按 id 查表取回,彻底不依赖顺序。那是结构性改动。
+    已排除(每条都是实测,不是推断):钩子挂错路(DSpark 不走 compute_draft_token_ids)、
+    dummy 跑的残留(begin_draft_pass 已修)、尾部 padding 多一个 block(截断已修)。
+    主流(verdict/reqs)不受影响,三轮独立采集 accept_len 4.542/4.546/4.551,完全可用。
     ★ 不缓冲、不分片。缓冲省的是压缩开销,换来的是「阈值没到整轮不落盘」「SIGKILL
       丢尾巴」两类静默数据丢失 —— 都实际发生过。采集跑不在乎这点速度。
     step            int32   global forward counter (this process)
