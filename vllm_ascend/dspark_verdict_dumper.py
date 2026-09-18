@@ -34,14 +34,13 @@ ENV
     DSPARK_VERDICT_DIR=<dir>       output directory (required when enabled)
     DSPARK_VERDICT_PROBS=0         drop the two probability columns (skips 3 small all-reduces)
     DSPARK_VERDICT_TAG=<str>       goes into the filenames; use it to tell the two drafts apart
-    DSPARK_VERDICT_FLUSH=20000     rows per output shard。⚠ 这个值必须远小于一次评测里
-                                   【每个 writer】产生的行数,否则整轮跑完不落盘且不报错
-                                   (踩过:gsm8k 全集 ns=5 = 219,640 行 ÷ DP2 ≈ 110k < 200000)。
-                                   另有 atexit 兜底,但 SIGKILL 下不执行 —— 别只靠它。
 
-OUTPUT   ``<dir>/verdict_<tag>_<pid>_<n>.npz``  +  ``<dir>/reqs_<tag>_<pid>.json``
+OUTPUT   ``<dir>/verdict_<tag>_<pid>.bin``(定长记录,流式追加,每个投机步一次 write)
+         ``<dir>/reqs_<tag>_<pid>.txt``(一行一个请求 id,行号 = ``req`` 列的取值)
+    ★ 不缓冲、不分片。缓冲省的是压缩开销,换来的是「阈值没到整轮不落盘」「SIGKILL
+      丢尾巴」两类静默数据丢失 —— 都实际发生过。采集跑不在乎这点速度。
     step            int32   global forward counter (this process)
-    req             int32   index into the reqs_*.json list of request-id strings
+    req             int32   行号,指向 reqs_*.txt 里的请求 id
     out_idx         int32   ★ index of this slot's token in the request's OUTPUT stream
     slot            int8    position inside the draft block (0 = first drafted token)
     draft_tok       int32   what the draft proposed
@@ -66,10 +65,7 @@ and the two runs then fail to align. Repeated per row (same value within a reque
 
 from __future__ import annotations
 
-import atexit
-import json
 import os
-import signal
 
 import numpy as np
 import torch
@@ -77,6 +73,18 @@ import torch
 from vllm.logger import logger
 
 _COLS_I32 = ("step", "req", "out_idx", "draft_tok", "target_tok", "bonus_tok")
+
+# 流式追加的定长记录。★ 为什么不缓冲:缓冲的唯一好处是摊薄压缩开销,而这是采集跑,慢一点
+# 无所谓;代价却是「阈值没到就整轮不落盘」「SIGKILL 丢尾巴」「要 atexit / 要 SIGTERM 处理器」
+# —— 这些坑我们一天之内全踩了一遍,而且每一个都是静默的。每步直接 append 之后,没有阈值、
+# 没有信号处理、没有分片编号,进程怎么死都只可能丢最后一步。30 字节/行 × 22 万行 = 6.6 MB,
+# 不值得为这点体积换回上面那串复杂度。
+_REC = np.dtype([
+    ("step", "<i4"), ("req", "<i4"), ("out_idx", "<i4"),
+    ("draft_tok", "<i4"), ("target_tok", "<i4"), ("bonus_tok", "<i4"),
+    ("slot", "i1"), ("accepted", "?"),
+    ("target_top1_p", "<f2"), ("target_p_draft", "<f2"),
+])
 
 
 class DsparkVerdictDumper:
@@ -89,11 +97,11 @@ class DsparkVerdictDumper:
         # num_draft_tokens=219,640 行,而 DP2 下两个 writer 各写一半 ≈110k —— 【都没到
         # 200000】,于是整轮跑完一个字节都没落盘,行全堆在 worker 内存里,没有任何报错。
         # 阈值必须远小于「一次正常评测的每-writer 行数」,否则它就是个静默丢数据的陷阱。
-        self.flush_rows = int(os.environ.get("DSPARK_VERDICT_FLUSH", "20000"))
 
         self._step = 0
-        self._shard = 0
-        self._rows: dict[str, list] = {}
+        self._buf: list[tuple] = []      # 仅在一次 capture 内累积,出函数即落盘
+        self._fh = None                  # 行文件(append,二进制)
+        self._fh_req = None              # 请求 id 文件(append,一行一个)
         self._req_ids: list[str] = []          # index -> request id string
         self._req_index: dict[str, int] = {}
         self._out_pos: dict[str, int] = {}     # request id -> next output index
@@ -114,13 +122,12 @@ class DsparkVerdictDumper:
             raise ValueError("DSPARK_VERDICT_DUMP=1 requires DSPARK_VERDICT_DIR")
         if self._is_writer:
             os.makedirs(self.out_dir, exist_ok=True)
-            # ⚠ 兜底:阈值是「够大的 run 才会触发」,atexit 是「多小的 run 都落得下来」。
-            # 两个都要 —— 只靠 atexit,SIGKILL 下不执行;只靠阈值,小数据集全丢。
-            atexit.register(self._flush_at_exit)
-            self._install_sigterm_flush()
+            base = os.path.join(self.out_dir, f"{{}}_{self.tag}_{os.getpid()}")
+            self._fh = open(base.format("verdict") + ".bin", "ab", buffering=0)
+            self._fh_req = open(base.format("reqs") + ".txt", "a", buffering=1)
             logger.info(
-                "DsparkVerdictDumper active: tag=%s probs=%s flush_every=%d -> %s",
-                self.tag, self.want_probs, self.flush_rows, self.out_dir,
+                "DsparkVerdictDumper active: tag=%s probs=%s streaming -> %s",
+                self.tag, self.want_probs, self._fh.name,
             )
 
     @property
@@ -203,6 +210,7 @@ class DsparkVerdictDumper:
                 ridx = len(self._req_ids)
                 self._req_index[rid] = ridx
                 self._req_ids.append(rid)
+                self._note_req(rid)
             base = self._out_pos.get(rid, 0)
             n_acc = max(0, n_emit[b] - 1)          # emitted = accepted drafts + 1 bonus
             for slot, i in enumerate(range(prev, end)):
@@ -216,20 +224,22 @@ class DsparkVerdictDumper:
             self._out_pos[rid] = base + n_emit[b]
             prev = end
 
-        if self._rows and len(self._rows["step"]) >= self.flush_rows:
-            self.flush()
+        # ★ 每个投机步直接落盘,不攒。buffering=0 意味着 write() 直达内核,进程被 SIGKILL
+        # 也只会丢正在写的这一步。
+        if self._buf:
+            np.asarray(self._buf, dtype=_REC).tofile(self._fh)
+            self._buf = []
 
     def _push(self, *, step, req, out_idx, slot, draft_tok, target_tok, bonus_tok,
               accepted, top1, pdraft):
-        r = self._rows
-        if not r:
-            for c in (*_COLS_I32, "slot", "accepted", "target_top1_p", "target_p_draft"):
-                r[c] = []
-        r["step"].append(step); r["req"].append(req); r["out_idx"].append(out_idx)
-        r["slot"].append(slot); r["draft_tok"].append(draft_tok); r["target_tok"].append(target_tok)
-        r["bonus_tok"].append(bonus_tok)
-        r["accepted"].append(accepted)
-        r["target_top1_p"].append(top1); r["target_p_draft"].append(pdraft)
+        # 顺序必须与 _REC 的字段顺序一致 —— 元组是按位置填进结构化数组的。
+        self._buf.append((step, req, out_idx, draft_tok, target_tok, bonus_tok,
+                          slot, accepted, top1, pdraft))
+
+    def _note_req(self, rid: str) -> None:
+        """新请求 id 追加一行。行号 = req 索引,所以【只能追加、不能重排】。"""
+        if self._fh_req is not None:
+            self._fh_req.write(rid.replace("\n", " ") + "\n")
 
     # ------------------------------------------------------------------ probabilities
 
@@ -292,69 +302,6 @@ class DsparkVerdictDumper:
         return (gmax - lse).exp().half().cpu(), (dlogit - lse).exp().half().cpu()
 
     # ------------------------------------------------------------------ output
-
-    def _install_sigterm_flush(self) -> None:
-        """在 SIGTERM 上刷盘,然后把信号交回原处理器。
-
-        ⚠ 为什么 atexit 不够(实测):vLLM 的执行器关停时对 worker 先发 SIGTERM、等一个宽限期
-        再发 SIGKILL —— 日志里那句 `[shutdown] Executor: workers still running after SIGTERM;
-        sending SIGKILL`。而 Python 对 SIGTERM 的默认处置是直接终止,【不跑 atexit】;SIGKILL
-        更不可能。结果就是:跑完一轮,每个 writer 最后那不到 flush_rows 行的残余全部丢失
-        (实测丢了 21,280 行 / 9.6%,而且丢的是尾部请求,跨 run join 会错位)。
-        SIGTERM 与 SIGKILL 之间的那个宽限期,是唯一能落盘的窗口。
-        """
-        try:
-            prev = signal.getsignal(signal.SIGTERM)
-        except Exception:  # noqa: BLE001
-            return
-
-        def _handler(signum, frame):
-            try:
-                if self._rows and self._rows.get("step"):
-                    self.flush()
-            except Exception:  # noqa: BLE001 — 关停路径,不能抛
-                pass
-            # 交回原行为,别改变 vLLM 自己的关停语义
-            if callable(prev):
-                prev(signum, frame)
-            else:
-                signal.signal(signal.SIGTERM, signal.SIG_DFL)
-                os.kill(os.getpid(), signum)
-
-        try:
-            signal.signal(signal.SIGTERM, _handler)
-        except ValueError:
-            # 只有主线程能装信号处理器;装不上就退回 atexit + 阈值
-            logger.warning("DsparkVerdictDumper: 非主线程,SIGTERM 刷盘未装,尾部可能丢失")
-
-    def _flush_at_exit(self) -> None:
-        """atexit 回调。解释器关停时 numpy/logging 可能已被拆掉,所以整段吞异常 ——
-        退出路径上抛异常只会淹没真正的退出原因,而这里最坏的结果是丢掉最后一个分片。"""
-        try:
-            if self._rows and self._rows.get("step"):
-                self.flush()
-        except Exception:  # noqa: BLE001 — 退出路径,不能抛
-            pass
-
-    def flush(self) -> None:
-        if not self.active or not self._rows or not self._rows["step"]:
-            return
-        path = os.path.join(self.out_dir, f"verdict_{self.tag}_{os.getpid()}_{self._shard}.npz")
-        np.savez_compressed(
-            path,
-            **{c: np.asarray(self._rows[c], dtype=np.int32) for c in _COLS_I32},
-            slot=np.asarray(self._rows["slot"], dtype=np.int8),
-            accepted=np.asarray(self._rows["accepted"], dtype=bool),
-            target_top1_p=np.asarray(self._rows["target_top1_p"], dtype=np.float16),
-            target_p_draft=np.asarray(self._rows["target_p_draft"], dtype=np.float16),
-        )
-        n = len(self._rows["step"])
-        self._rows = {}
-        self._shard += 1
-        with open(os.path.join(self.out_dir, f"reqs_{self.tag}_{os.getpid()}.json"), "w") as fh:
-            json.dump(self._req_ids, fh)
-        logger.info("DsparkVerdictDumper wrote %d rows -> %s", n, path)
-
 
 _DUMPER: DsparkVerdictDumper | None = None
 
