@@ -98,6 +98,30 @@ def greedy_sample(logits: torch.Tensor) -> torch.Tensor:
     return target_argmax
 
 
+def greedy_sample_topk(logits: torch.Tensor, k: int) -> torch.Tensor:
+    """全局 top-k token id,形状 [B, k]。仅供 verdict dumper 使用,默认不调用。
+
+    logits 是按词表 TP 切片的(每个 rank 只有 V_local 列),所以本地 topk 拿到的是【本 rank 内】
+    的前 k 名,不是全局前 k。照 greedy_sample 的办法扩:本地 topk -> all_gather 值和【全局】
+    下标 -> 在 k*world 个候选里再取一次 topk。一次 all_gather,和 greedy_sample 同量级。
+
+    ⚠ 下标必须在 all_gather 【之前】加上 rank*V_local 变成全局下标 —— 之后再加就分不清哪个
+    值来自哪个 rank 了。
+    """
+    tp_group = get_tp_group()
+    _, v_local = logits.shape
+    rank = tp_group.rank_in_group
+    kk = min(k, v_local)
+
+    local_v, local_i = logits.topk(kk, dim=-1)                     # [B, kk]
+    local_gi = local_i + rank * v_local                            # 全局下标
+
+    gathered_v = tp_group.all_gather(local_v, dim=-1)              # [B, kk*world]
+    gathered_gi = tp_group.all_gather(local_gi, dim=-1)            # [B, kk*world]
+    sel = gathered_v.topk(min(k, gathered_v.shape[-1]), dim=-1).indices
+    return gathered_gi.gather(dim=-1, index=sel)                   # [B, k]
+
+
 # TODO(lilinsiman): Remove this code segment after future versions of the GLM
 # series models support graph input for speculative inference.
 def _is_glm_model(model_config) -> bool:
@@ -1281,6 +1305,15 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         """
         if self.method in ("eagle3", "dflash", "dspark"):
             logits = self.model.logits_processor(self.model.lm_head, hidden_states)
+            # verdict dumper 的 top-k 采集。★ 必须挂在这里:草稿 logits 只在本作用域存在,
+            # 到了拒绝采样器手上只剩已经 argmax 过的 draft_token_ids。默认 no-op
+            # (DSPARK_VERDICT_TOPK=0)。回答的是「目标要的那个词排在草稿的第几位」——
+            # rank 2-5 = 草稿知道但排错序(蒸馏问题),top-k 之外 = 草稿不知道(容量问题)。
+            from vllm_ascend.dspark_verdict_dumper import get_verdict_dumper  # noqa: PLC0415
+
+            _vd = get_verdict_dumper()
+            if _vd.topk > 0:
+                _vd.push_draft_topk(greedy_sample_topk(logits, _vd.topk))
             if not hasattr(self.model, "draft_id_to_target_id") or self.model.draft_id_to_target_id is None:
                 return self._sample_draft_from_logits(logits, sampling_metadata)
             # With vocab remapping, draft probs live in draft-vocab space and
