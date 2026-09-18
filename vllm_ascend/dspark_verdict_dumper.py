@@ -120,7 +120,12 @@ class DsparkVerdictDumper:
         self._step = 0
         # ★ top-k 侧流。放【单独的文件】而不是加宽主记录:主格式保持不变(旧分析照跑),
         # top-k 可选、K 可变,而且文件名里带 K 所以自描述。行序与主流严格一一对应。
-        self.topk = int(os.environ.get("DSPARK_VERDICT_TOPK", "0"))
+        # ⚠ 没开 dump 时必须【强制归零】。proposer 里 top-k 那段只看 `_vd.topk > 0`,不看
+        # enabled —— 上一轮采集留在 shell 里的 DSPARK_VERDICT_TOPK=64,会让下一轮只想跑
+        # 干净评测的 serve 照样每个草稿位做一次全词表 topk(129280 类 × 每 slot × 每步),
+        # 算完谁也不写。accept_len 不受影响,但 tok/s 白掉一截,而且不留任何痕迹 ——
+        # 正好污染那个用来和基线比吞吐的数。
+        self.topk = int(os.environ.get("DSPARK_VERDICT_TOPK", "0")) if self.enabled else 0
         self._topk_iters: list = []      # 本步各次草稿迭代的 [B, K],capture 时拼装
         self._topk_req_ids: list[str] | None = None   # proposer 那批的请求 id(按行)
         self._topk_debug = os.environ.get("DSPARK_VERDICT_TOPK_DEBUG", "0") == "1"
