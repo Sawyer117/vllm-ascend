@@ -98,6 +98,7 @@ class DsparkVerdictDumper:
         self._out_pos: dict[str, int] = {}     # request id -> next output index
         self._batch_req_ids: list[str] | None = None
         self._warned_nongreedy = False
+        self._warned_no_req_ids = False
         self._is_writer = False
 
         if not self.enabled:
@@ -180,8 +181,21 @@ class DsparkVerdictDumper:
 
         prev = 0
         for b, end in enumerate(cu):
-            rid = self._batch_req_ids[b] if self._batch_req_ids and b < len(self._batch_req_ids) \
-                else f"?slot{b}"
+            if self._batch_req_ids and b < len(self._batch_req_ids):
+                rid = self._batch_req_ids[b]
+            else:
+                # ⚠ 没有请求 id = 这份 dump 【无法 join】。槽位在请求之间复用,所以 `?slotN`
+                # 会把不相干的请求拼成一条流,out_idx 随之失去意义。以前这里静默回退,结果是
+                # 采了 20 万行、列齐全、看着完好、实际报废(MRV1 上没挂 set_batch_req_ids)。
+                # 宁可吵,也不要再产出一份「看着能用」的废数据。
+                if not self._warned_no_req_ids:
+                    self._warned_no_req_ids = True
+                    logger.error(
+                        "DsparkVerdictDumper: 模型运行器没有交接 req_ids —— 本次 dump 的 "
+                        "out_idx 【不可用于跨 run join】。该运行器缺少 "
+                        "get_verdict_dumper().set_batch_req_ids(...) 调用。"
+                    )
+                rid = f"?slot{b}"
             ridx = self._req_index.get(rid)
             if ridx is None:
                 ridx = len(self._req_ids)
