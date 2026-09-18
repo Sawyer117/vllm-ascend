@@ -1608,6 +1608,18 @@ class NPUModelRunner(GPUModelRunner):
                 num_draft_tokens,
                 cu_num_tokens,
             )
+
+            # 拒绝采样器拿不到请求 id,而批次【槽位在请求之间循环复用】—— 不在这里交接,
+            # 逐 slot 的接受/拒绝 dump 就归不到请求上,`out_idx` 退化成「所有曾占用过该槽位
+            # 的请求拼成的流里的位置」,既不对应真实请求、也不会在两次 run 之间复现,整份
+            # dump 无法 join。⚠ 这不是假想:MRV2 那边挂了钩子、MRV1 这边没有,于是 released
+            # 那一轮采到的 20 万行全部带着 `?slot{b}` 这个回退 id,只能作废重采。
+            # `cu_num_draft_tokens` 是对【全部 num_reqs】做的 cumsum(含 0 草稿的请求),
+            # 所以采样器里的 b 正是 input_batch 的索引 —— 顺序必须用 input_batch.req_ids。
+            # 除非 DSPARK_VERDICT_DUMP=1,否则是 no-op。
+            from vllm_ascend.dspark_verdict_dumper import get_verdict_dumper  # noqa: PLC0415
+
+            get_verdict_dumper().set_batch_req_ids(self.input_batch.req_ids[:num_reqs])
             logits_indices = spec_decode_metadata.logits_indices
             num_sampled_tokens = num_draft_tokens + 1
 
