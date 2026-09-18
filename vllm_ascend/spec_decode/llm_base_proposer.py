@@ -1183,6 +1183,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                     _vd = get_verdict_dumper()
                     _vd_k = _vd.topk
                     _vd.begin_draft_pass()   # 清掉上一趟(可能是 dummy 跑)的残留
+                    if _vd_k > 0:
+                        # ★ 交出本批的请求 id,让 capture 按 id 对齐而不是按位置 —— 调度器会在
+                        # 草稿与验证之间丢/重排请求。第 b 行 = input_batch 第 b 个请求:
+                        # token_indices_to_sample 取的是 query_start_loc[1:]-1,按 input_batch 序。
+                        _rb = getattr(getattr(self, "runner", None), "input_batch", None)
+                        _vd.set_draft_topk_req_ids(list(_rb.req_ids[:num_blk]) if _rb is not None else None)
                     for idx in range(self.num_speculative_tokens):
                         markov_emb = self.model.markov_embed(draft_token_ids[:, idx])
                         logits_bias = self.model.markov_bias(markov_emb)

@@ -31,8 +31,7 @@ warning rather than writing numbers that look comparable and are not. Our evals 
 
 ENV
     DSPARK_VERDICT_DUMP=1          enable
-    DSPARK_VERDICT_TOPK=64         ⚠⚠ 【目前不可用,默认关,别开】。另外记草稿的全局 top-k
-                                   token id。
+    DSPARK_VERDICT_TOPK=64         另外记草稿的全局 top-k token id(0=关,默认关)。
                                    回答:目标要的那个词排在草稿的第几位?rank 2-5 = 草稿知道
                                    但排错序(蒸馏/损失问题);top-k 之外 = 草稿不知道(容量
                                    问题)。⚠ 单路径 dump 只能算【首个断点处】的覆盖率,推不出
@@ -46,17 +45,17 @@ OUTPUT   ``<dir>/verdict_<tag>_<pid>.bin``(定长记录,流式追加,每个投�
          ``<dir>/reqs_<tag>_<pid>.txt``(一行一个请求 id,行号 = ``req`` 列的取值)
          ``<dir>/topk<K>_<tag>_<pid>.bin``(K×int32/行,行序与主流严格对应;仅 TOPK>0 时)
 
-★★ TOPK 的已知阻塞(2026-09-18,实测五轮,别再从转置查起)
-    最后停在:`行数 20 vs 20,首列不符 5 行` —— 行数对得上,但 20 行里正好一整个 block
-    (5 行)错位。这【不是】转置问题。
-    真因:proposer 草稿的那批请求,与采样器验证的那批,集合/顺序不一致。中间隔着调度器 ——
-    proposer 出完草稿后,调度器可能丢掉或重排请求,而采样器的 draft_token_ids 是从
-    scheduler_output.scheduled_spec_decode_tokens 按 input_batch 顺序【重建】的。
-    ⟹ 按位置对齐这条路走不通,无论怎么转置。正确修法是【按 req_id 交接】:proposer push
-       时带上本批的请求 id,capture() 按 id 查表取回,彻底不依赖顺序。那是结构性改动。
-    已排除(每条都是实测,不是推断):钩子挂错路(DSpark 不走 compute_draft_token_ids)、
-    dummy 跑的残留(begin_draft_pass 已修)、尾部 padding 多一个 block(截断已修)。
-    主流(verdict/reqs)不受影响,三轮独立采集 accept_len 4.542/4.546/4.551,完全可用。
+★★ TOPK 为什么按 req_id 对齐(2026-09-18,实测五轮才定位,别改回按位置)
+    五轮实测依次撞到:钩子挂错路(DSpark 不走 compute_draft_token_ids)→ dummy 跑的残留
+    (begin_draft_pass)→ 尾部 padding 多一个 block(截断)→ 最后停在
+    `行数 20 vs 20,首列不符 5 行`:行数对得上,但正好一整个 block 错位。
+    真因:proposer 草稿的那批请求,与采样器验证的那批,集合/顺序不一致 —— 中间隔着调度器,
+    它在草稿与验证之间可能丢掉或重排请求,而采样器的 draft_token_ids 是按 input_batch 顺序
+    从 scheduler_output.scheduled_spec_decode_tokens【重建】的。
+    ⟹ 按位置对齐无论怎么转置都会在某些步上错开。现在两边都用 req_id 说话:proposer 交出
+       本批的 req_ids(set_draft_topk_req_ids),capture() 按采样器的验证顺序查表重排。
+    ⚠ 「首列必须逐行等于 draft_token_ids」那条校验保留 —— 它同时兜住「proposer 第 b 行 =
+       input_batch 第 b 个请求」这个映射假设。
     ★ 不缓冲、不分片。缓冲省的是压缩开销,换来的是「阈值没到整轮不落盘」「SIGKILL
       丢尾巴」两类静默数据丢失 —— 都实际发生过。采集跑不在乎这点速度。
     step            int32   global forward counter (this process)
@@ -123,6 +122,10 @@ class DsparkVerdictDumper:
         # top-k 可选、K 可变,而且文件名里带 K 所以自描述。行序与主流严格一一对应。
         self.topk = int(os.environ.get("DSPARK_VERDICT_TOPK", "0"))
         self._topk_iters: list = []      # 本步各次草稿迭代的 [B, K],capture 时拼装
+        self._topk_req_ids: list[str] | None = None   # proposer 那批的请求 id(按行)
+        self._topk_debug = os.environ.get("DSPARK_VERDICT_TOPK_DEBUG", "0") == "1"
+        self._topk_dbg_left = 3
+        self._topk_skipped = 0        # 跳过的步数;静默降级必须看得见
         self._topk_dead = False          # 对齐校验失败后置位,只停 top-k,不影响主流
         self._fh_topk = None
         self._buf: list[tuple] = []      # 仅在一次 capture 内累积,出函数即落盘
@@ -134,7 +137,6 @@ class DsparkVerdictDumper:
         self._batch_req_ids: list[str] | None = None
         self._warned_nongreedy = False
         self._warned_no_req_ids = False
-        self._warned_topk_skip = False
         self._is_writer = False
 
         if not self.enabled:
@@ -173,6 +175,19 @@ class DsparkVerdictDumper:
         """
         if self.topk > 0:
             self._topk_iters = []
+
+    def set_draft_topk_req_ids(self, req_ids) -> None:
+        """proposer 交出【它这批】的请求 id,按行对应。
+
+        ★★ 这是 top-k 能对上的关键,也是五轮试错的结论。proposer 出完草稿之后,调度器可能
+        丢掉或重排请求,而采样器的 draft_token_ids 是按 input_batch 顺序从 scheduler_output
+        【重建】的 —— 两边的行顺序没有任何保证。按位置对齐(无论怎么转置)都会在某些步上错开
+        整整一个 block(实测 20 行里错 5 行)。两边都用 req_id 说话,顺序就无关了。
+        proposer 的第 b 行 = input_batch 的第 b 个请求(token_indices_to_sample 取的是
+        query_start_loc[1:]-1,即每个请求的最后一个 token,按 input_batch 顺序)。
+        """
+        if self.topk > 0:
+            self._topk_req_ids = list(req_ids) if req_ids is not None else None
 
     def push_draft_topk(self, topk: "torch.Tensor") -> None:
         """proposer 每草一位调一次,传 [B, K] 的全局 top-k id。
@@ -240,6 +255,7 @@ class DsparkVerdictDumper:
             probs_draft = probs_draft.tolist()
 
         prev = 0
+        rids_in_order: list[str] = []   # 本步【实际产出草稿行】的请求,按采样器切片顺序
         for b, end in enumerate(cu):
             if self._batch_req_ids and b < len(self._batch_req_ids):
                 rid = self._batch_req_ids[b]
@@ -263,6 +279,8 @@ class DsparkVerdictDumper:
                 self._req_ids.append(rid)
                 self._note_req(rid)
             base = self._out_pos.get(rid, 0)
+            if end > prev:
+                rids_in_order.append(rid)   # 0 草稿的请求不进采样器的 draft_token_ids
             n_acc = max(0, n_emit[b] - 1)          # emitted = accepted drafts + 1 bonus
             for slot, i in enumerate(range(prev, end)):
                 self._push(
@@ -280,48 +298,77 @@ class DsparkVerdictDumper:
         if self._buf:
             np.asarray(self._buf, dtype=_REC).tofile(self._fh)
             self._buf = []
-        self._write_topk(draft_token_ids)
+        self._write_topk(draft_token_ids, rids_in_order)
 
-    def _write_topk(self, draft_token_ids) -> None:
-        """把本步累积的 top-k 转成 req-major 并落盘,附逐行对齐自检。
+    def _write_topk(self, draft_token_ids, rids_in_order) -> None:
+        """按 req_id 把本步的 top-k 摆成采样器的顺序并落盘,附逐行自检。
 
-        ★ 自检就是整件事的关键。proposer 给的是 slot-major [K 次迭代][B 个请求],采样器要的是
-        req-major [B][K];转置错了会得到一份【行数完全正确、内容全错】的数据 —— 今天这类
-        "看着完整的废数据" 已经坑过两次(?slot 回退、阈值不落盘)。而 top-k 的第 0 列必须
-        逐行等于 draft_token_ids(草稿选的就是它自己的第 1 名),这是一条不花钱、且转置一旦
-        错位就必然触发的全覆盖校验。不通过就【只停 top-k】、保住主流,并且只吵一次。
+        rids_in_order = 采样器这一步【实际验证】的请求 id,按 cu_num_draft_tokens 的切片顺序。
+        proposer 那批用 self._topk_req_ids 标识。两者取交集并按采样器的顺序重排。
+
+        ★ 自检不变:摆好之后 top-k 的第 0 列必须逐行等于 draft_token_ids。它同时兜住了
+        「行→请求映射假设是否成立」—— 假设错了,重排完必然对不上。
         """
         iters, self._topk_iters = self._topk_iters, []
+        p_rids, self._topk_req_ids = self._topk_req_ids, None
         if self.topk <= 0 or self._topk_dead or self._fh_topk is None or not iters:
             return
         try:
-            stacked = torch.stack(iters, dim=1)          # [B, n_iter, K]  <- slot-major 转 req-major
-            flat = stacked.reshape(-1, stacked.shape[-1])
+            stacked = torch.stack(iters, dim=1)          # [B, n_iter, k]  slot-major -> req-major
             want = draft_token_ids.detach().to("cpu", torch.int32).reshape(-1)
-            # ⚠ proposer 按【padding 后】的批草稿(DP 对齐的哑请求等),而 cu_num_draft_tokens
-            # 只覆盖真实请求 —— 实测 25 vs 20,正好多一个 block。padding 在尾部,截掉即可。
-            # ★ 截断的正确性不靠「padding 一定在尾部」这个假设,靠下面那条【逐行】校验兜底:
-            # 首列必须等于 draft_token_ids,padding 若不在尾部,截完必然对不上。
-            if flat.shape[0] > want.numel():
-                flat = flat[: want.numel()]
-            if flat.shape[0] != want.numel() or not torch.equal(flat[:, 0], want):
-                bad = int((flat[:, 0] != want).sum()) if flat.shape[0] == want.numel() else -1
+            n_slot = stacked.shape[1]
+
+            if p_rids is None:
+                raise RuntimeError("proposer 没有交出 req_ids(set_draft_topk_req_ids 未调用)")
+            pos = {r: i for i, r in enumerate(p_rids[: stacked.shape[0]])}
+            missing = [r for r in rids_in_order if r not in pos]
+            if missing:
+                # ⚠ 永久停,不是跳过:一个请求不可能没被草稿过却拿到草稿 token,所以这只能是
+                # 「proposer 第 b 行 = input_batch 第 b 个请求」这个映射不成立 —— 结构性问题,
+                # 后面每一步都会重演。跳过的话就是一条警告 + 整轮静默无数据,今天已经吃过。
                 self._topk_dead = True
                 logger.error(
-                    "DsparkVerdictDumper: top-k 与 draft_token_ids 对不齐(行数 %d vs %d,"
-                    "首列不符 %s 行)—— 已停止写 top-k,主流不受影响。proposer 的输出顺序"
-                    "与 cu_num_draft_tokens 的切片顺序不一致,转置逻辑要改。",
+                    "DsparkVerdictDumper: 采样器这步验证的 %d 个请求里有 %d 个不在 proposer "
+                    "那批(%d 个)里,例 %s —— 行->请求的映射不成立,已永久停止写 top-k,"
+                    "主流不受影响。开 DSPARK_VERDICT_TOPK_DEBUG=1 打印两边的 rids。",
+                    len(rids_in_order), len(missing), len(pos), missing[:3],
+                )
+                if self._topk_debug:
+                    logger.error("[TOPK-DEBUG] proposer rids=%s\n             采样器 rids=%s",
+                                 p_rids[:12], list(rids_in_order)[:12])
+                return
+            sel = torch.tensor([pos[r] for r in rids_in_order], dtype=torch.long)
+            flat = stacked[sel].reshape(-1, stacked.shape[-1])
+
+            if flat.shape[0] != want.numel() or not torch.equal(flat[:, 0], want):
+                bad = int((flat[:, 0] != want).sum()) if flat.shape[0] == want.numel() else -1
+                if self._topk_debug and self._topk_dbg_left > 0:
+                    self._topk_dbg_left -= 1
+                    logger.error(
+                        "[TOPK-DEBUG] proposer B=%d slots=%d rids=%s\n"
+                        "             采样器 rids=%s\n"
+                        "             重排后首列=%s\n"
+                        "             draft_token=%s",
+                        stacked.shape[0], n_slot, p_rids[:6], list(rids_in_order)[:6],
+                        flat[:12, 0].tolist(), want[:12].tolist(),
+                    )
+                self._topk_dead = True
+                logger.error(
+                    "DsparkVerdictDumper: 按 req_id 重排后 top-k 仍与 draft_token_ids 不符"
+                    "(行数 %d vs %d,首列不符 %s 行)—— 已停止写 top-k,主流不受影响。"
+                    "说明「proposer 第 b 行 = input_batch 第 b 个请求」这个映射不成立。"
+                    "开 DSPARK_VERDICT_TOPK_DEBUG=1 可打印两边的 rids 与首列。",
                     flat.shape[0], want.numel(), bad,
                 )
                 return
             flat.numpy().astype(np.int32).tofile(self._fh_topk)
         except Exception as e:  # noqa: BLE001
-            # ⚠ 不置 _topk_dead:形状不齐之类是【这一步】的问题(比如混进了 dummy 跑的残留),
-            # 跳过这步即可。只有「首列与 draft_token_ids 不符」才是系统性错位,那个才永久停。
-            # 之前一律永久停,结果一次 dummy 残留就让整轮 top-k 全废。
-            if not self._warned_topk_skip:
-                self._warned_topk_skip = True
-                logger.warning("DsparkVerdictDumper: 某步 top-k 落盘失败,已跳过该步(只报一次):%r", e)
+            self._topk_skipped += 1
+            # ⚠ 不只报一次:只报一次 = 整轮静默少数据而没人知道。按指数间隔持续报,
+            # 既不刷屏,又让「跳了很多步」这件事一定会浮出来。
+            if self._topk_skipped in (1, 10, 100, 1000, 10000):
+                logger.warning("DsparkVerdictDumper: top-k 已跳过 %d 步(最近一次:%r)",
+                               self._topk_skipped, e)
 
     def _push(self, *, step, req, out_idx, slot, draft_tok, target_tok, bonus_tok,
               accepted, top1, pdraft):
