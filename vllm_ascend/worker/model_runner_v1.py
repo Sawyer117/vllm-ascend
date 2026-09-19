@@ -2148,6 +2148,43 @@ class NPUModelRunner(GPUModelRunner):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:
                 hidden_states, aux_hidden_states = hidden_states
+
+            # Plan B: dump DSpark target hidden states (opt-in DSPARK_HS_DUMP=1).
+            #
+            # ★ WHY HERE AND NOT ONLY IN MRV2. 4a37d3339 moved this hook to
+            # worker/v2/model_runner.py on the assumption that mainline DSpark runs on MRV2.
+            # On this pin it does NOT: `use_v2_model_runner` is a vLLM property gated on
+            # `VLLM_USE_V2_MODEL_RUNNER` or, unset, on a model allowlist that DeepSeek-V4 does
+            # not hit -- and that fallback is SILENT (vllm/config/vllm.py logs a reason only for
+            # the Triton / unsupported-feature branches). Measured on 186: the HS-dump serve log
+            # names model_runner_v1.py 24 times and worker/v2/model_runner.py zero times.
+            # A v2-only hook therefore applies cleanly and then writes nothing at all.
+            # Keeping BOTH hooks means the dumper follows whichever runner is actually selected.
+            #
+            # Placement mirrors the MRV2 one: AFTER _model_forward, which is where
+            # _all_gather_hidden_states_and_aux runs under flashcomm v1. Before that gather each
+            # rank holds only its own shard and the dump would be silently fragmented.
+            # aux_hidden_states here is list[Tensor] of [T, H] (same as MRV2 -- see the cat at
+            # `torch.cat([h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)` above),
+            # so stacking on dim=1 gives the [seq, L, H] the flush path writes. Format unchanged.
+            if aux_hidden_states is not None and get_pp_group().is_last_rank:
+                if getattr(self, "_dspark_hs_dumper", None) is None:
+                    from vllm_ascend.dspark_hs_dumper import DsparkHSDumper
+
+                    self._dspark_hs_dumper = DsparkHSDumper()
+                if self._dspark_hs_dumper.active:
+                    _hs_rids = self.input_batch.req_ids
+                    _hs_sched = scheduler_output.num_scheduled_tokens
+                    self._dspark_hs_dumper.capture(
+                        # v1 keys scheduled tokens by req_id; capture() wants batch order.
+                        num_scheduled_tokens=[_hs_sched[r] for r in _hs_rids],
+                        req_ids=_hs_rids,
+                        prompt_lens=self.input_batch.num_prompt_tokens,
+                        hidden_states=hidden_states,
+                        aux_buffer=torch.stack(list(aux_hidden_states), dim=1),
+                        input_ids=self.input_ids.gpu,
+                        num_tokens=scheduler_output.total_num_scheduled_tokens,
+                    )
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
