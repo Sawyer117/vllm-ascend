@@ -19,6 +19,7 @@
 
 import logging
 import math
+import os
 import sys
 import time
 from collections import defaultdict
@@ -3610,6 +3611,33 @@ class NPUModelRunner(GPUModelRunner):
                 with get_tp_context(self.drafter):
                     self.drafter.load_model(self.model)
 
+            # DSPARK_HS_DUMP=1:target-only 的 aux 捕获(HS 生产端没有草稿,因而没有
+            # speculative_config)。use_aux_hidden_state_outputs 整段只在 __init__ 的
+            # `if self.speculative_config:` 里置位(model_runner_v1.py:610),所以纯 target
+            # serve 上它恒为 False,aux 永远不会被算出来 —— 于是 dumper 一个文件都写不出,
+            # 而且【不报错】。老 pin 上不需要这一步:那时 get_mtp_target_hidden_states() 返回
+            # 的就是 dspark 的 [T, L*H] aux scratch;这个 pin 上它改成了 MTP 的 pre-hc_head
+            # 残差缓冲 (max_num_batched_tokens, hc_mult*hidden_size),不是同一个东西。
+            # 层号解析要复刻 _get_eagle3_aux_layers_from_config 的 +1:aux 约定是 POST-layer
+            # (含残差),[40,41,42] -> (41,42,43)。少这个 +1 会静默地 dump 错层。
+            _hs_dump_aux = None
+            if os.environ.get("DSPARK_HS_DUMP") == "1" and not self.use_aux_hidden_state_outputs:
+                _ids = getattr(self.model_config.hf_config, "dspark_target_layer_ids", None)
+                if _ids:
+                    _hs_dump_aux = tuple(i + 1 for i in _ids)
+                    self.use_aux_hidden_state_outputs = True
+                    logger.info(
+                        "DSPARK_HS_DUMP: target-only aux capture on, layers %s "
+                        "(from dspark_target_layer_ids %s, +1 = post-layer)",
+                        _hs_dump_aux, list(_ids),
+                    )
+                else:
+                    logger.warning(
+                        "DSPARK_HS_DUMP=1 but the target hf_config has no "
+                        "dspark_target_layer_ids -- pass --hf-overrides "
+                        '\'{"dspark_target_layer_ids":[40,41,42]}\'. No HS will be written.'
+                    )
+
             pp_group = get_pp_group()
             should_configure_aux_hidden_states = (
                 self.use_aux_hidden_state_outputs
@@ -3625,7 +3653,9 @@ class NPUModelRunner(GPUModelRunner):
                         "aux_hidden_state_outputs was requested"
                     )
 
-                aux_layers = self._get_eagle3_aux_layers_from_config()
+                # _hs_dump_aux 优先:_get_eagle3_aux_layers_from_config 会访问
+                # self.speculative_config.use_dspark(),纯 target serve 上那是 None。
+                aux_layers = _hs_dump_aux or self._get_eagle3_aux_layers_from_config()
                 if not aux_layers:
                     aux_layers = self.model.get_eagle3_default_aux_hidden_state_layers()
                 self.model.set_aux_hidden_state_layers(aux_layers)
