@@ -38,6 +38,7 @@ from vllm.model_executor.models.utils import (
     process_eagle_weight,
 )
 
+from vllm_ascend.models.deepseek_v4.dspark_width import dspark_draft_layer_config, dspark_draft_num_experts
 from vllm_ascend.models.deepseek_v4.model import (
     DeepseekV2DecoderLayer,
     DeepseekV2MixtureOfExperts,
@@ -134,11 +135,23 @@ class DeepseekV4DSparkModel(nn.Module):
             quant_config=vllm_config.quant_config,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
+        # The draft layers are built from the target's config unless the draft config sets its
+        # own MoE width (dspark_n_routed_experts / dspark_num_experts_per_tok).
+        layer_config = dspark_draft_layer_config(vllm_config.model_config.hf_config, config)
+        if layer_config is not None:
+            logger.info(
+                "DSpark draft MoE width: %d routed experts, top-%d (target: %d, top-%d)",
+                layer_config.n_routed_experts,
+                layer_config.num_experts_per_tok,
+                vllm_config.model_config.hf_config.n_routed_experts,
+                vllm_config.model_config.hf_config.num_experts_per_tok,
+            )
         self.layers = nn.ModuleDict(
             {
                 str(self.mtp_start_layer_idx + idx): DeepseekV2DecoderLayer(
                     vllm_config,
                     prefix=f"mtp.{idx}",
+                    config=layer_config,
                     is_draft_layer=True,
                 )
                 for idx in range(self.num_dspark_layers)
@@ -306,7 +319,7 @@ class DeepseekV4DSparkModel(nn.Module):
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.n_routed_experts,
+            num_experts=dspark_draft_num_experts(self.config),
             num_redundant_experts=0,
         )
 
